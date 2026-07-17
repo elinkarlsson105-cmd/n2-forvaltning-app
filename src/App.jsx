@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { supabase } from "./lib/supabaseClient";
+import jsPDF from "jspdf";
+import autoTable from "jspdf-autotable";
 
 /* ------------------------------------------------------------------ */
 /*  Fönsterkort — planeringsverktyg för fastighetsskötare              */
@@ -31,6 +33,92 @@ const daysBetween = (a, b) => Math.round((new Date(b) - new Date(a)) / 86400000)
 const fmtDate = (iso) =>
   new Date(iso + "T00:00:00").toLocaleDateString("sv-SE", { day: "numeric", month: "short" });
 
+const SORT_OPTIONS = [
+  { value: "datum-senaste", label: "Datum (senaste först)" },
+  { value: "datum-aldsta", label: "Datum (äldsta först)" },
+  { value: "timmar-flest", label: "Antal timmar (flest först)" },
+  { value: "timmar-farst", label: "Antal timmar (färst först)" },
+  { value: "belopp-hogst", label: "Belopp (högst först)" },
+  { value: "belopp-lagst", label: "Belopp (lägst först)" },
+  { value: "typ", label: "Typ av tjänst (A–Ö)" },
+];
+
+// metricsFor(order) ska returnera { date, hours, amount }
+function sortOrders(list, sortBy, metricsFor) {
+  const arr = list.slice();
+  const comparators = {
+    "datum-senaste": (a, b) => (metricsFor(b).date || "").localeCompare(metricsFor(a).date || ""),
+    "datum-aldsta": (a, b) => (metricsFor(a).date || "").localeCompare(metricsFor(b).date || ""),
+    "timmar-flest": (a, b) => metricsFor(b).hours - metricsFor(a).hours,
+    "timmar-farst": (a, b) => metricsFor(a).hours - metricsFor(b).hours,
+    "belopp-hogst": (a, b) => metricsFor(b).amount - metricsFor(a).amount,
+    "belopp-lagst": (a, b) => metricsFor(a).amount - metricsFor(b).amount,
+    typ: (a, b) => (a.type || "").localeCompare(b.type || ""),
+  };
+  arr.sort(comparators[sortBy] || (() => 0));
+  return arr;
+}
+
+function filterOrders(list, { type = "alla", category = "alla" } = {}) {
+  return list.filter(
+    (o) => (type === "alla" || o.type === type) && (category === "alla" || o.priceCategory === category)
+  );
+}
+
+function SortFilterBar({
+  sortBy,
+  setSortBy,
+  filterType,
+  setFilterType,
+  filterCategory,
+  setFilterCategory,
+  filterProperty,
+  setFilterProperty,
+  properties,
+}) {
+  return (
+    <div style={S.sortFilterBar}>
+      <label style={S.sortFilterField}>
+        <span style={S.sortFilterLabel}>Sortera</span>
+        <select className="fk-input" style={S.sortFilterSelect} value={sortBy} onChange={(e) => setSortBy(e.target.value)}>
+          {SORT_OPTIONS.map((opt) => (
+            <option key={opt.value} value={opt.value}>{opt.label}</option>
+          ))}
+        </select>
+      </label>
+      {setFilterProperty && properties && properties.length > 1 && (
+        <label style={S.sortFilterField}>
+          <span style={S.sortFilterLabel}>Bostadsrättsförening</span>
+          <select className="fk-input" style={S.sortFilterSelect} value={filterProperty} onChange={(e) => setFilterProperty(e.target.value)}>
+            <option value="alla">Alla</option>
+            {properties.map((p) => (
+              <option key={p.id} value={p.id}>{p.name}</option>
+            ))}
+          </select>
+        </label>
+      )}
+      {setFilterType && (
+        <label style={S.sortFilterField}>
+          <span style={S.sortFilterLabel}>Typ av tjänst</span>
+          <select className="fk-input" style={S.sortFilterSelect} value={filterType} onChange={(e) => setFilterType(e.target.value)}>
+            <option value="alla">Alla</option>
+            <option value="felanmalan">Felanmälan</option>
+            <option value="tillaggstjanst">Tilläggstjänst</option>
+          </select>
+        </label>
+      )}
+      <label style={S.sortFilterField}>
+        <span style={S.sortFilterLabel}>Kategori</span>
+        <select className="fk-input" style={S.sortFilterSelect} value={filterCategory} onChange={(e) => setFilterCategory(e.target.value)}>
+          <option value="alla">Alla</option>
+          <option value="FA">FA</option>
+          <option value="TEK">TEK</option>
+        </select>
+      </label>
+    </div>
+  );
+}
+
 const seedState = () => ({
   properties: [
     {
@@ -39,6 +127,7 @@ const seedState = () => ({
       address: "Kvarngatan 4, 112 20 Stockholm",
       notes: "",
       contacts: [],
+      rates: { FA: 0, TEK: 0, BIL: 0 },
     },
     {
       id: uid(),
@@ -46,6 +135,7 @@ const seedState = () => ({
       address: "Ekbacken 12, 141 41 Huddinge",
       notes: "",
       contacts: [],
+      rates: { FA: 0, TEK: 0, BIL: 0 },
     },
   ],
   tasks: [],
@@ -55,15 +145,47 @@ const seedState = () => ({
   billableOrders: [],
   billableTimeEntries: [],
   invoiceBasis: [],
+  nextOrderNumber: 1,
 });
 
-const normalize = (loaded) => ({
-  ...seedState(),
-  ...loaded,
-  billableOrders: loaded.billableOrders || [],
-  billableTimeEntries: loaded.billableTimeEntries || [],
-  invoiceBasis: loaded.invoiceBasis || [],
+const normalizeProperty = (p) => ({
+  ...p,
+  rates: {
+    FA: Number(p.rates?.FA || 0),
+    TEK: Number(p.rates?.TEK || 0),
+    BIL: Number(p.rates?.BIL || 0),
+  },
 });
+
+const normalizeOrder = (o) => ({
+  ...o,
+  type: o.type === "felanmalan" || o.type === "tillaggstjanst" ? o.type : "tillaggstjanst",
+  status: o.status === "Klar" || o.status === "Avslutad" ? "Klar" : "Pågår",
+  reportedDate: o.reportedDate || o.createdAt || todayISO(),
+  priceCategory: o.priceCategory === "FA" || o.priceCategory === "TEK" ? o.priceCategory : "FA",
+  billCount: Number(o.billCount || 0),
+  billInvoicedInBasisId: o.billInvoicedInBasisId || null,
+});
+
+const normalize = (loaded) => {
+  const orders = (loaded.billableOrders || []).map(normalizeOrder);
+  let counter = loaded.nextOrderNumber || 1;
+  const numberedOrders = orders.map((o) => {
+    if (o.orderNumber) return o;
+    const numbered = { ...o, orderNumber: counter };
+    counter += 1;
+    return numbered;
+  });
+  return {
+    ...seedState(),
+    ...loaded,
+    properties: (loaded.properties || seedState().properties).map(normalizeProperty),
+    billableOrders: numberedOrders,
+    billableTimeEntries: loaded.billableTimeEntries || [],
+    invoiceBasis: loaded.invoiceBasis || [],
+    nextOrderNumber: counter,
+  };
+};
 
 /* ------------------------------ storage (Supabase) ------------------------------ */
 
@@ -192,6 +314,7 @@ export default function App() {
   const [name, setName] = useState("");
   const [tab, setTab] = useState("oversikt");
   const [toast, setToast] = useState(null);
+  const [propertyModal, setPropertyModal] = useState(null); // null | "add" | { editId }
 
   useEffect(() => {
     if (toast) {
@@ -201,6 +324,16 @@ export default function App() {
   }, [toast]);
 
   const notify = (msg) => setToast(msg);
+
+  // Om den valda föreningen tas bort, gå tillbaka till "Alla" — men rör
+  // aldrig "Alla" i sig, det är alltid ett giltigt läge.
+  useEffect(() => {
+    if (!state || propertyId === "all") return;
+    const stillExists = state.properties.some((p) => p.id === propertyId);
+    if (!stillExists) {
+      setPropertyId("all");
+    }
+  }, [state, propertyId]);
 
   if (loading || !state) {
     return (
@@ -215,19 +348,62 @@ export default function App() {
   }
 
   const properties = state.properties;
-  const scopedProps =
-    propertyId === "all" ? properties : properties.filter((p) => p.id === propertyId);
+  const scopedProps = propertyId === "all" ? properties : properties.filter((p) => p.id === propertyId);
+  const selectedProperty = propertyId === "all" ? null : scopedProps[0] || null;
+  const billing = createBillingActions(state, setState, name, notify);
+
+  const savePropertyForm = (payload) => {
+    if (propertyModal && propertyModal !== "add") {
+      setState({
+        ...state,
+        properties: state.properties.map((p) =>
+          p.id === propertyModal.editId ? { ...p, ...payload } : p
+        ),
+      });
+      notify("Bostadsrättsförening uppdaterad");
+    } else {
+      const newProp = { id: uid(), ...payload };
+      setState({ ...state, properties: [...state.properties, newProp] });
+      setPropertyId(newProp.id);
+      notify("Bostadsrättsförening tillagd");
+    }
+    setPropertyModal(null);
+  };
+
+  const removeProperty = (id) => {
+    const orphanOrderIds = new Set(
+      (state.billableOrders || []).filter((o) => o.propertyId === id).map((o) => o.id)
+    );
+    setState({
+      ...state,
+      properties: state.properties.filter((p) => p.id !== id),
+      tasks: state.tasks.filter((t) => t.propertyId !== id),
+      checklistTemplates: state.checklistTemplates.filter((c) => c.propertyId !== id),
+      checklistRuns: state.checklistRuns.filter((r) => r.propertyId !== id),
+      issues: state.issues.filter((i) => i.propertyId !== id),
+      billableOrders: (state.billableOrders || []).filter((o) => o.propertyId !== id),
+      billableTimeEntries: (state.billableTimeEntries || []).filter((e) => !orphanOrderIds.has(e.orderId)),
+      invoiceBasis: (state.invoiceBasis || []).filter((b) => b.propertyId !== id),
+    });
+    notify("Bostadsrättsförening borttagen");
+  };
 
   const tabs = [
     { id: "oversikt", label: "Översikt" },
-    { id: "fastigheter", label: "Fastigheter" },
     { id: "uppgifter", label: "Uppgifter" },
     { id: "checklistor", label: "Checklistor" },
     { id: "arenden", label: "Ärenden" },
+    { id: "felanmalan", label: "Felanmälan" },
+    { id: "tillaggstjanst", label: "Tilläggstjänster" },
     { id: "debitering", label: "Debitering" },
     { id: "kalender", label: "Kalender" },
     { id: "backup", label: "Backup" },
   ];
+
+  const editingProperty =
+    propertyModal && propertyModal !== "add"
+      ? properties.find((p) => p.id === propertyModal.editId)
+      : null;
 
   return (
     <div style={S.app}>
@@ -253,82 +429,135 @@ export default function App() {
         properties={properties}
         propertyId={propertyId}
         setPropertyId={setPropertyId}
+        onAddNew={() => setPropertyModal("add")}
         name={name}
         setName={setName}
         saving={saving}
         lastSavedAt={lastSavedAt}
       />
 
-      <nav style={S.tabRow} className="fk-scroll">
-        {tabs.map((t) => (
-          <button
-            key={t.id}
-            className="fk-tab-btn"
-            onClick={() => setTab(t.id)}
-            style={{ ...S.tabBtn, ...(tab === t.id ? S.tabBtnActive : {}) }}
-          >
-            {t.label}
-          </button>
-        ))}
-      </nav>
+      {properties.length === 0 ? (
+        <main style={S.main} className="fk-scroll">
+          <div style={{ maxWidth: 560, margin: "40px auto 0" }}>
+            <div style={{ ...S.taskCardTitle, fontSize: 19, marginBottom: 6 }}>
+              Välkommen! Lägg till er första bostadsrättsförening
+            </div>
+            <div style={{ ...S.rowSub, marginBottom: 16 }}>
+              Allt i appen — uppgifter, checklistor, ärenden och debitering — organiseras per
+              förening. Börja med att lägga till en.
+            </div>
+            <PropertyForm onSubmit={savePropertyForm} onCancel={null} />
+          </div>
+        </main>
+      ) : (
+        <>
+          <nav style={S.tabRow} className="fk-scroll">
+            {tabs.map((t) => (
+              <button
+                key={t.id}
+                className="fk-tab-btn"
+                onClick={() => setTab(t.id)}
+                style={{ ...S.tabBtn, ...(tab === t.id ? S.tabBtnActive : {}) }}
+              >
+                {t.label}
+              </button>
+            ))}
+          </nav>
 
-      <main style={S.main} className="fk-scroll">
-        {tab === "oversikt" && (
-          <Oversikt state={state} scopedProps={scopedProps} setTab={setTab} />
-        )}
-        {tab === "fastigheter" && (
-          <Fastigheter
-            state={state}
-            setState={setState}
-            notify={notify}
-            onSelectProperty={setPropertyId}
+          <main style={S.main} className="fk-scroll">
+            {tab === "oversikt" && (
+              <Oversikt
+                state={state}
+                scopedProps={scopedProps}
+                selectedProperty={selectedProperty}
+                setTab={setTab}
+                onEditProperty={() => setPropertyModal({ editId: selectedProperty.id })}
+                onRemoveProperty={removeProperty}
+              />
+            )}
+            {tab === "uppgifter" && (
+              <Uppgifter
+                state={state}
+                setState={setState}
+                scopedProps={scopedProps}
+                actor={name}
+                notify={notify}
+              />
+            )}
+            {tab === "checklistor" && (
+              <Checklistor
+                state={state}
+                setState={setState}
+                scopedProps={scopedProps}
+                actor={name}
+                notify={notify}
+              />
+            )}
+            {tab === "arenden" && (
+              <Arenden
+                state={state}
+                setState={setState}
+                scopedProps={scopedProps}
+                actor={name}
+                notify={notify}
+              />
+            )}
+            {tab === "felanmalan" && (
+              <ArendeQueue
+                type="felanmalan"
+                title="Felanmälningar"
+                newLabel="+ Ny felanmälan"
+                titleFieldLabel="Vad är felet?"
+                titlePlaceholder="t.ex. Läckande stamledning"
+                emptyText="Inga pågående felanmälningar. Registrera en, och klarmarkera när jobbet är utfört — då flyttas den till Debitering."
+                state={state}
+                scopedProps={scopedProps}
+                billing={billing}
+                notify={notify}
+              />
+            )}
+            {tab === "tillaggstjanst" && (
+              <ArendeQueue
+                type="tillaggstjanst"
+                title="Tilläggstjänster"
+                newLabel="+ Ny tilläggstjänst"
+                titleFieldLabel="Vad gäller tjänsten?"
+                titlePlaceholder="t.ex. Extra röjning på begäran"
+                emptyText="Inga pågående tilläggstjänster. Registrera en, och klarmarkera när jobbet är utfört — då flyttas den till Debitering."
+                state={state}
+                scopedProps={scopedProps}
+                billing={billing}
+                notify={notify}
+              />
+            )}
+            {tab === "debitering" && (
+              <Debitering
+                state={state}
+                scopedProps={scopedProps}
+                billing={billing}
+                notify={notify}
+              />
+            )}
+            {tab === "kalender" && <Kalender state={state} scopedProps={scopedProps} />}
+            {tab === "backup" && (
+              <Backup state={state} setState={setState} notify={notify} lastSavedAt={lastSavedAt} />
+            )}
+          </main>
+        </>
+      )}
+
+      {propertyModal && properties.length > 0 && (
+        <Modal onClose={() => setPropertyModal(null)}>
+          <div style={S.taskCardTitle}>
+            {propertyModal === "add" ? "Ny bostadsrättsförening" : "Redigera förening"}
+          </div>
+          <PropertyForm
+            initial={editingProperty}
+            onSubmit={savePropertyForm}
+            onCancel={() => setPropertyModal(null)}
           />
-        )}
-        {tab === "uppgifter" && (
-          <Uppgifter
-            state={state}
-            setState={setState}
-            scopedProps={scopedProps}
-            allProperties={properties}
-            actor={name}
-            notify={notify}
-          />
-        )}
-        {tab === "checklistor" && (
-          <Checklistor
-            state={state}
-            setState={setState}
-            scopedProps={scopedProps}
-            allProperties={properties}
-            actor={name}
-            notify={notify}
-          />
-        )}
-        {tab === "arenden" && (
-          <Arenden
-            state={state}
-            setState={setState}
-            scopedProps={scopedProps}
-            allProperties={properties}
-            actor={name}
-            notify={notify}
-          />
-        )}
-        {tab === "debitering" && (
-          <Debitering
-            state={state}
-            setState={setState}
-            scopedProps={scopedProps}
-            allProperties={properties}
-            actor={name}
-            notify={notify}
-          />
-        )}
-        {tab === "kalender" && <Kalender state={state} scopedProps={scopedProps} />}
-        {tab === "backup" && (
-          <Backup state={state} setState={setState} notify={notify} lastSavedAt={lastSavedAt} />
-        )}
-      </main>
+        </Modal>
+      )}
 
       {error && (
         <div style={S.errorBar}>
@@ -341,14 +570,27 @@ export default function App() {
   );
 }
 
+/* ------------------------------ modal ------------------------------ */
+
+function Modal({ children, onClose }) {
+  return (
+    <div style={S.modalBackdrop} onClick={onClose}>
+      <div style={S.modalPanel} onClick={(e) => e.stopPropagation()}>
+        <button onClick={onClose} style={S.modalClose} aria-label="Stäng">×</button>
+        {children}
+      </div>
+    </div>
+  );
+}
+
 /* ------------------------------ header ------------------------------ */
 
-function Header({ properties, propertyId, setPropertyId, name, setName, saving, lastSavedAt }) {
+function Header({ properties, propertyId, setPropertyId, onAddNew, name, setName, saving, lastSavedAt }) {
   const savedLabel = saving
     ? "sparar…"
     : lastSavedAt
     ? `sparat ${lastSavedAt.toLocaleTimeString("sv-SE", { hour: "2-digit", minute: "2-digit" })}`
-    : "fastighetsjournal";
+    : "föreningsjournal";
   return (
     <header style={S.header}>
       <div style={S.headerLeft}>
@@ -359,19 +601,30 @@ function Header({ properties, propertyId, setPropertyId, name, setName, saving, 
         </div>
       </div>
       <div style={S.headerRight}>
-        <select
-          className="fk-input"
-          value={propertyId}
-          onChange={(e) => setPropertyId(e.target.value)}
-          style={S.selectHeader}
+        {properties.length > 0 && (
+          <select
+            className="fk-input"
+            value={propertyId}
+            onChange={(e) => setPropertyId(e.target.value)}
+            style={S.selectHeader}
+          >
+            <option value="all">Alla bostadsrättsföreningar</option>
+            {properties.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+              </option>
+            ))}
+          </select>
+        )}
+        <button
+          type="button"
+          onClick={onAddNew}
+          style={S.addPropertyBtn}
+          className="fk-btn"
+          title="Lägg till ny bostadsrättsförening"
         >
-          <option value="all">Alla fastigheter</option>
-          {properties.map((p) => (
-            <option key={p.id} value={p.id}>
-              {p.name}
-            </option>
-          ))}
-        </select>
+          + Förening
+        </button>
         <input
           className="fk-input"
           placeholder="Ditt namn"
@@ -384,144 +637,15 @@ function Header({ properties, propertyId, setPropertyId, name, setName, saving, 
   );
 }
 
-/* ------------------------------ fastigheter ------------------------------ */
-
-function Fastigheter({ state, setState, notify, onSelectProperty }) {
-  const [showForm, setShowForm] = useState(false);
-  const [editingId, setEditingId] = useState(null);
-  const [expandedId, setExpandedId] = useState(null);
-
-  const startAdd = () => {
-    setEditingId(null);
-    setShowForm(true);
-  };
-
-  const startEdit = (p) => {
-    setEditingId(p.id);
-    setShowForm(true);
-  };
-
-  const saveProperty = (payload) => {
-    if (editingId) {
-      setState({
-        ...state,
-        properties: state.properties.map((p) => (p.id === editingId ? { ...p, ...payload } : p)),
-      });
-      notify("Fastighet uppdaterad");
-    } else {
-      const newProp = { id: uid(), ...payload };
-      setState({ ...state, properties: [...state.properties, newProp] });
-      onSelectProperty(newProp.id);
-      notify("Fastighet tillagd");
-    }
-    setShowForm(false);
-    setEditingId(null);
-  };
-
-  const removeProperty = (id) => {
-    const orphanOrderIds = new Set(
-      (state.billableOrders || []).filter((o) => o.propertyId === id).map((o) => o.id)
-    );
-    setState({
-      ...state,
-      properties: state.properties.filter((p) => p.id !== id),
-      tasks: state.tasks.filter((t) => t.propertyId !== id),
-      checklistTemplates: state.checklistTemplates.filter((c) => c.propertyId !== id),
-      checklistRuns: state.checklistRuns.filter((r) => r.propertyId !== id),
-      issues: state.issues.filter((i) => i.propertyId !== id),
-      billableOrders: (state.billableOrders || []).filter((o) => o.propertyId !== id),
-      billableTimeEntries: (state.billableTimeEntries || []).filter((e) => !orphanOrderIds.has(e.orderId)),
-      invoiceBasis: (state.invoiceBasis || []).filter((b) => b.propertyId !== id),
-    });
-    if (editingId === id) {
-      setShowForm(false);
-      setEditingId(null);
-    }
-  };
-
-  const editingProperty = editingId ? state.properties.find((p) => p.id === editingId) : null;
-
-  return (
-    <div style={{ animation: "fk-rise .25s ease" }}>
-      <div style={S.sectionHead}>
-        <h2 style={S.h2}>Fastigheter</h2>
-        <button style={S.primaryBtn} className="fk-btn" onClick={startAdd}>
-          {showForm && !editingId ? "Avbryt" : "+ Ny fastighet"}
-        </button>
-      </div>
-
-      {showForm && (
-        <PropertyForm
-          key={editingId || "new"}
-          initial={editingProperty}
-          onSubmit={saveProperty}
-          onCancel={() => {
-            setShowForm(false);
-            setEditingId(null);
-          }}
-        />
-      )}
-
-      {state.properties.length === 0 ? (
-        <EmptyNote text="Inga fastigheter registrerade ännu." />
-      ) : (
-        <div style={S.checklistStack}>
-          {state.properties.map((p) => {
-            const expanded = expandedId === p.id;
-            const contacts = p.contacts || [];
-            return (
-              <div key={p.id} style={S.checklistCard}>
-                <div style={S.checklistHead}>
-                  <div>
-                    <div style={S.taskCardTitle}>{p.name}</div>
-                    <div style={S.taskCardProp}>{p.address || "Ingen adress angiven"}</div>
-                  </div>
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <button style={S.stampBtn} className="fk-btn" onClick={() => startEdit(p)}>
-                      Redigera
-                    </button>
-                    <button style={S.miniDelete} onClick={() => removeProperty(p.id)} aria-label="Ta bort fastighet">×</button>
-                  </div>
-                </div>
-
-                {contacts.length > 0 && (
-                  <div style={S.runBox}>
-                    {contacts.map((c) => (
-                      <div key={c.id} style={S.contactRow}>
-                        <span style={S.contactRole}>{c.role}</span>
-                        <span style={S.contactName}>{c.name}</span>
-                        <span style={S.rowSub}>
-                          {[c.phone, c.email].filter(Boolean).join(" · ") || "—"}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {p.notes && (
-                  <div style={S.historyRow}>
-                    <button
-                      onClick={() => setExpandedId(expanded ? null : p.id)}
-                      style={S.linkBtn}
-                    >
-                      {expanded ? "Dölj anteckningar" : "Visa anteckningar"}
-                    </button>
-                    {expanded && <div style={{ ...S.rowSub, marginTop: 6, whiteSpace: "pre-wrap" }}>{p.notes}</div>}
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      )}
-    </div>
-  );
-}
+/* ------------------------------ bostadsrättsförening ------------------------------ */
 
 function PropertyForm({ initial, onSubmit, onCancel }) {
   const [name, setName] = useState(initial?.name || "");
   const [address, setAddress] = useState(initial?.address || "");
   const [notes, setNotes] = useState(initial?.notes || "");
+  const [faRate, setFaRate] = useState(initial?.rates?.FA ?? "");
+  const [tekRate, setTekRate] = useState(initial?.rates?.TEK ?? "");
+  const [bilRate, setBilRate] = useState(initial?.rates?.BIL ?? "");
   const [contacts, setContacts] = useState(
     initial?.contacts?.length ? initial.contacts : [{ id: uid(), role: CONTACT_ROLES[0], name: "", phone: "", email: "" }]
   );
@@ -542,20 +666,73 @@ function PropertyForm({ initial, onSubmit, onCancel }) {
     e.preventDefault();
     if (!name.trim()) return;
     const cleanContacts = contacts.filter((c) => c.name.trim() || c.phone.trim() || c.email.trim());
-    onSubmit({ name: name.trim(), address: address.trim(), notes: notes.trim(), contacts: cleanContacts });
+    onSubmit({
+      name: name.trim(),
+      address: address.trim(),
+      notes: notes.trim(),
+      contacts: cleanContacts,
+      rates: { FA: Number(faRate) || 0, TEK: Number(tekRate) || 0, BIL: Number(bilRate) || 0 },
+    });
   };
 
   return (
     <form onSubmit={submit} style={S.formPanel}>
       <div style={S.formRow}>
         <label style={S.label}>
-          Fastighetsnamn
-          <input className="fk-input" style={S.input} value={name} onChange={(e) => setName(e.target.value)} placeholder="t.ex. Kvarngatan 4" required />
+          Föreningens namn
+          <input className="fk-input" style={S.input} value={name} onChange={(e) => setName(e.target.value)} placeholder="t.ex. BRF Kvarngatan 4" required />
         </label>
         <label style={S.label}>
           Adress
           <input className="fk-input" style={S.input} value={address} onChange={(e) => setAddress(e.target.value)} placeholder="Gatuadress, postnr, ort" />
         </label>
+      </div>
+
+      <div>
+        <div style={{ ...S.label, marginBottom: 8 }}>
+          Prissättning — kopplas till Felanmälan/Tilläggstjänster och används för nyckeltalen i Debitering
+        </div>
+        <div style={S.formRow}>
+          <label style={S.label}>
+            FA — kr/h
+            <input
+              className="fk-input"
+              style={S.input}
+              type="number"
+              min="0"
+              value={faRate}
+              onChange={(e) => setFaRate(e.target.value)}
+              placeholder="t.ex. 650"
+            />
+          </label>
+          <label style={S.label}>
+            TEK — kr/h
+            <input
+              className="fk-input"
+              style={S.input}
+              type="number"
+              min="0"
+              value={tekRate}
+              onChange={(e) => setTekRate(e.target.value)}
+              placeholder="t.ex. 850"
+            />
+          </label>
+        </div>
+        <div style={{ ...S.formRow, marginTop: 10 }}>
+          <label style={S.label}>
+            BIL — kr/styck
+            <input
+              className="fk-input"
+              style={S.input}
+              type="number"
+              min="0"
+              value={bilRate}
+              onChange={(e) => setBilRate(e.target.value)}
+              placeholder="t.ex. 50"
+            />
+          </label>
+          <div />
+        </div>
       </div>
 
       <div>
@@ -613,8 +790,14 @@ function PropertyForm({ initial, onSubmit, onCancel }) {
       </label>
 
       <div style={{ display: "flex", gap: 8 }}>
-        <button type="submit" style={S.primaryBtn} className="fk-btn">Spara fastighet</button>
-        <button type="button" onClick={onCancel} style={S.secondaryBtn} className="fk-btn">Avbryt</button>
+        <button type="submit" style={S.primaryBtn} className="fk-btn">
+          {initial ? "Spara ändringar" : "Spara förening"}
+        </button>
+        {onCancel && (
+          <button type="button" onClick={onCancel} style={S.secondaryBtn} className="fk-btn">
+            Avbryt
+          </button>
+        )}
       </div>
     </form>
   );
@@ -623,21 +806,124 @@ function PropertyForm({ initial, onSubmit, onCancel }) {
 /* ------------------------------ översikt ------------------------------ */
 
 
-function Oversikt({ state, scopedProps, setTab }) {
+function Oversikt({ state, scopedProps, selectedProperty, setTab, onEditProperty, onRemoveProperty }) {
   const ids = new Set(scopedProps.map((p) => p.id));
   const tasks = state.tasks.filter((t) => ids.has(t.propertyId));
   const issues = state.issues.filter((i) => ids.has(i.propertyId));
+  const orders = state.billableOrders || [];
   const today = todayISO();
 
   const overdue = tasks.filter((t) => t.nextDue < today);
   const dueSoon = tasks.filter((t) => t.nextDue >= today && daysBetween(today, t.nextDue) <= 7);
   const openIssues = issues.filter((i) => i.status !== "Klar");
   const acuteIssues = openIssues.filter((i) => i.priority === "Akut");
+  const openFelanmalan = orders.filter((o) => ids.has(o.propertyId) && o.type === "felanmalan" && o.status !== "Klar");
+  const openTillaggstjanst = orders.filter((o) => ids.has(o.propertyId) && o.type === "tillaggstjanst" && o.status !== "Klar");
 
   const propName = (id) => state.properties.find((p) => p.id === id)?.name || "";
 
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [notesExpanded, setNotesExpanded] = useState(false);
+
   return (
     <div style={{ animation: "fk-rise .25s ease" }}>
+      {selectedProperty && (
+        <div style={{ ...S.checklistCard, marginBottom: 18 }}>
+          <div style={S.checklistHead}>
+            <div>
+              <div style={{ ...S.taskCardTitle, fontSize: 19 }}>{selectedProperty.name}</div>
+              <div style={S.taskCardProp}>{selectedProperty.address || "Ingen adress angiven"}</div>
+              <div style={{ ...S.rowSub, marginTop: 4 }}>
+                FA {selectedProperty.rates?.FA || 0} kr/h · TEK {selectedProperty.rates?.TEK || 0} kr/h · BIL {selectedProperty.rates?.BIL || 0} kr/st
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button style={S.stampBtn} className="fk-btn" onClick={onEditProperty}>
+                Redigera
+              </button>
+              {confirmingDelete ? (
+                <button
+                  style={{ ...S.stampBtn, background: "#C4171C" }}
+                  className="fk-btn"
+                  onClick={() => onRemoveProperty(selectedProperty.id)}
+                >
+                  Bekräfta borttagning
+                </button>
+              ) : (
+                <button style={S.miniDelete} onClick={() => setConfirmingDelete(true)} aria-label="Ta bort förening">×</button>
+              )}
+            </div>
+          </div>
+
+          {(selectedProperty.contacts || []).length > 0 && (
+            <div style={S.runBox}>
+              {selectedProperty.contacts.map((c) => (
+                <div key={c.id} style={S.contactRow}>
+                  <span style={S.contactRole}>{c.role}</span>
+                  <span style={S.contactName}>{c.name}</span>
+                  <span style={S.rowSub}>{[c.phone, c.email].filter(Boolean).join(" · ") || "—"}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {selectedProperty.notes && (
+            <div style={S.historyRow}>
+              <button onClick={() => setNotesExpanded((v) => !v)} style={S.linkBtn}>
+                {notesExpanded ? "Dölj anteckningar" : "Visa anteckningar"}
+              </button>
+              {notesExpanded && (
+                <div style={{ ...S.rowSub, marginTop: 6, whiteSpace: "pre-wrap" }}>{selectedProperty.notes}</div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {!selectedProperty && (
+        <div style={{ ...S.panel, marginBottom: 18 }}>
+          <h2 style={{ ...S.h2, marginBottom: 4 }}>Alla bostadsrättsföreningar</h2>
+          <div style={{ ...S.rowSub, marginBottom: 14 }}>
+            Sammanställning över samtliga {scopedProps.length} föreningar. Välj en specifik förening i listan högst upp för att se och redigera dess detaljer.
+          </div>
+          {scopedProps.length === 0 ? (
+            <EmptyNote text="Inga bostadsrättsföreningar ännu." />
+          ) : (
+            <div style={{ overflowX: "auto" }}>
+              <table style={S.summaryTable}>
+                <thead>
+                  <tr>
+                    <th style={S.summaryTh}>Förening</th>
+                    <th style={S.summaryTh}>Försenade</th>
+                    <th style={S.summaryTh}>Öppna ärenden</th>
+                    <th style={S.summaryTh}>Öppna felanmälningar</th>
+                    <th style={S.summaryTh}>Öppna tilläggstjänster</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {scopedProps.map((p) => {
+                    const pTasks = tasks.filter((t) => t.propertyId === p.id);
+                    const pOverdue = pTasks.filter((t) => t.nextDue < today).length;
+                    const pOpenIssues = issues.filter((i) => i.propertyId === p.id && i.status !== "Klar").length;
+                    const pOpenFelanmalan = openFelanmalan.filter((o) => o.propertyId === p.id).length;
+                    const pOpenTillaggstjanst = openTillaggstjanst.filter((o) => o.propertyId === p.id).length;
+                    return (
+                      <tr key={p.id}>
+                        <td style={S.summaryTd}>{p.name}</td>
+                        <td style={{ ...S.summaryTd, color: pOverdue ? "#C4171C" : "#5C594E" }}>{pOverdue}</td>
+                        <td style={{ ...S.summaryTd, color: pOpenIssues ? "#EA5B0C" : "#5C594E" }}>{pOpenIssues}</td>
+                        <td style={{ ...S.summaryTd, color: pOpenFelanmalan ? "#EA5B0C" : "#5C594E" }}>{pOpenFelanmalan}</td>
+                        <td style={{ ...S.summaryTd, color: pOpenTillaggstjanst ? "#EA5B0C" : "#5C594E" }}>{pOpenTillaggstjanst}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
       <div style={S.statGrid}>
         <StatCard
           label="Försenade uppgifter"
@@ -658,10 +944,16 @@ function Oversikt({ state, scopedProps, setTab }) {
           onClick={() => setTab("arenden")}
         />
         <StatCard
-          label="Fastigheter"
-          value={scopedProps.length}
-          tone="neutral"
-          onClick={() => setTab("uppgifter")}
+          label="Öppna felanmälningar"
+          value={openFelanmalan.length}
+          tone={openFelanmalan.length ? "warn" : "neutral"}
+          onClick={() => setTab("felanmalan")}
+        />
+        <StatCard
+          label="Öppna tilläggstjänster"
+          value={openTillaggstjanst.length}
+          tone={openTillaggstjanst.length ? "accent" : "neutral"}
+          onClick={() => setTab("tillaggstjanst")}
         />
       </div>
 
@@ -737,16 +1029,16 @@ function EmptyNote({ text }) {
 
 /* ------------------------------ uppgifter ------------------------------ */
 
-function Uppgifter({ state, setState, scopedProps, allProperties, actor, notify }) {
+function Uppgifter({ state, setState, scopedProps, actor, notify }) {
   const [showForm, setShowForm] = useState(false);
   const ids = new Set(scopedProps.map((p) => p.id));
+  const showPropertyTag = scopedProps.length > 1;
+  const propName = (id) => state.properties.find((p) => p.id === id)?.name || "";
   const today = todayISO();
 
   const tasks = state.tasks
     .filter((t) => ids.has(t.propertyId))
     .sort((a, b) => (a.nextDue < b.nextDue ? -1 : 1));
-
-  const propName = (id) => state.properties.find((p) => p.id === id)?.name || "";
 
   const markDone = (task) => {
     const nextDue = addDays(today, task.intervalDays);
@@ -775,13 +1067,7 @@ function Uppgifter({ state, setState, scopedProps, allProperties, actor, notify 
         </button>
       </div>
 
-      {showForm && (
-        <TaskForm
-          properties={allProperties}
-          defaultPropertyId={scopedProps[0]?.id}
-          onSubmit={addTask}
-        />
-      )}
+      {showForm && <TaskForm properties={scopedProps} onSubmit={addTask} />}
 
       {tasks.length === 0 ? (
         <EmptyNote text="Inga uppgifter ännu. Lägg till återkommande skötsel, t.ex. snöröjning eller filterbyte." />
@@ -802,8 +1088,10 @@ function Uppgifter({ state, setState, scopedProps, allProperties, actor, notify 
                     ×
                   </button>
                 </div>
-                <div style={S.taskCardTitle}>{t.title}</div>
-                <div style={S.taskCardProp}>{propName(t.propertyId)}</div>
+                <div style={S.taskCardTitle}>
+                  {t.title}
+                  {showPropertyTag && <span style={S.propertyTag}>{propName(t.propertyId)}</span>}
+                </div>
                 <div style={S.taskCardMeta}>
                   Var {t.intervalDays}:e dag
                   {t.lastDone && <> · senast {fmtDate(t.lastDone)} av {t.lastDoneBy}</>}
@@ -833,11 +1121,25 @@ function StampBadge({ dueDate, overdue, dueSoon }) {
   );
 }
 
-function TaskForm({ properties, defaultPropertyId, onSubmit }) {
+function PropertyPicker({ properties, value, onChange }) {
+  if (properties.length <= 1) return null;
+  return (
+    <label style={S.label}>
+      Bostadsrättsförening
+      <select className="fk-input" style={S.input} value={value} onChange={(e) => onChange(e.target.value)}>
+        {properties.map((p) => (
+          <option key={p.id} value={p.id}>{p.name}</option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+function TaskForm({ properties, onSubmit }) {
   const [title, setTitle] = useState("");
   const [category, setCategory] = useState(CATEGORIES[0]);
-  const [propertyId, setPropertyId] = useState(defaultPropertyId || properties[0]?.id);
   const [intervalDays, setIntervalDays] = useState(30);
+  const [propertyId, setPropertyId] = useState(properties[0]?.id || "");
 
   const submit = (e) => {
     e.preventDefault();
@@ -859,14 +1161,7 @@ function TaskForm({ properties, defaultPropertyId, onSubmit }) {
             required
           />
         </label>
-        <label style={S.label}>
-          Fastighet
-          <select className="fk-input" style={S.input} value={propertyId} onChange={(e) => setPropertyId(e.target.value)}>
-            {properties.map((p) => (
-              <option key={p.id} value={p.id}>{p.name}</option>
-            ))}
-          </select>
-        </label>
+        <PropertyPicker properties={properties} value={propertyId} onChange={setPropertyId} />
       </div>
       <div style={S.formRow}>
         <label style={S.label}>
@@ -896,11 +1191,12 @@ function TaskForm({ properties, defaultPropertyId, onSubmit }) {
 
 /* ------------------------------ checklistor ------------------------------ */
 
-function Checklistor({ state, setState, scopedProps, allProperties, actor, notify }) {
+function Checklistor({ state, setState, scopedProps, actor, notify }) {
   const [showForm, setShowForm] = useState(false);
   const ids = new Set(scopedProps.map((p) => p.id));
-  const templates = state.checklistTemplates.filter((t) => ids.has(t.propertyId));
+  const showPropertyTag = scopedProps.length > 1;
   const propName = (id) => state.properties.find((p) => p.id === id)?.name || "";
+  const templates = state.checklistTemplates.filter((t) => ids.has(t.propertyId));
 
   const addTemplate = (payload) => {
     setState({
@@ -960,9 +1256,7 @@ function Checklistor({ state, setState, scopedProps, allProperties, actor, notif
         </button>
       </div>
 
-      {showForm && (
-        <ChecklistForm properties={allProperties} defaultPropertyId={scopedProps[0]?.id} onSubmit={addTemplate} />
-      )}
+      {showForm && <ChecklistForm properties={scopedProps} onSubmit={addTemplate} />}
 
       {templates.length === 0 ? (
         <EmptyNote text="Inga checklistor ännu. Skapa en mall för t.ex. veckorondering." />
@@ -975,8 +1269,11 @@ function Checklistor({ state, setState, scopedProps, allProperties, actor, notif
               <div key={tmpl.id} style={S.checklistCard}>
                 <div style={S.checklistHead}>
                   <div>
-                    <div style={S.taskCardTitle}>{tmpl.title}</div>
-                    <div style={S.taskCardProp}>{propName(tmpl.propertyId)} · {tmpl.items.length} punkter</div>
+                    <div style={S.taskCardTitle}>
+                      {tmpl.title}
+                      {showPropertyTag && <span style={S.propertyTag}>{propName(tmpl.propertyId)}</span>}
+                    </div>
+                    <div style={S.taskCardProp}>{tmpl.items.length} punkter</div>
                   </div>
                   <div style={{ display: "flex", gap: 8 }}>
                     {!activeRun && (
@@ -1035,10 +1332,10 @@ function Checklistor({ state, setState, scopedProps, allProperties, actor, notif
   );
 }
 
-function ChecklistForm({ properties, defaultPropertyId, onSubmit }) {
+function ChecklistForm({ properties, onSubmit }) {
   const [title, setTitle] = useState("");
-  const [propertyId, setPropertyId] = useState(defaultPropertyId || properties[0]?.id);
   const [itemsText, setItemsText] = useState("");
+  const [propertyId, setPropertyId] = useState(properties[0]?.id || "");
 
   const submit = (e) => {
     e.preventDefault();
@@ -1054,14 +1351,7 @@ function ChecklistForm({ properties, defaultPropertyId, onSubmit }) {
           Namn på checklista
           <input className="fk-input" style={S.input} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="t.ex. Veckorondering källare" required />
         </label>
-        <label style={S.label}>
-          Fastighet
-          <select className="fk-input" style={S.input} value={propertyId} onChange={(e) => setPropertyId(e.target.value)}>
-            {properties.map((p) => (
-              <option key={p.id} value={p.id}>{p.name}</option>
-            ))}
-          </select>
-        </label>
+        <PropertyPicker properties={properties} value={propertyId} onChange={setPropertyId} />
       </div>
       <label style={S.label}>
         Punkter (en per rad)
@@ -1081,13 +1371,14 @@ function ChecklistForm({ properties, defaultPropertyId, onSubmit }) {
 
 /* ------------------------------ ärenden ------------------------------ */
 
-function Arenden({ state, setState, scopedProps, allProperties, actor, notify }) {
+function Arenden({ state, setState, scopedProps, actor, notify }) {
   const [showForm, setShowForm] = useState(false);
   const ids = new Set(scopedProps.map((p) => p.id));
+  const showPropertyTag = scopedProps.length > 1;
+  const propName = (id) => state.properties.find((p) => p.id === id)?.name || "";
   const issues = state.issues
     .filter((i) => ids.has(i.propertyId))
     .sort((a, b) => (a.reportedAt < b.reportedAt ? 1 : -1));
-  const propName = (id) => state.properties.find((p) => p.id === id)?.name || "";
 
   const addIssue = (payload) => {
     const issue = {
@@ -1117,9 +1408,7 @@ function Arenden({ state, setState, scopedProps, allProperties, actor, notify })
         </button>
       </div>
 
-      {showForm && (
-        <IssueForm properties={allProperties} defaultPropertyId={scopedProps[0]?.id} onSubmit={addIssue} />
-      )}
+      {showForm && <IssueForm properties={scopedProps} onSubmit={addIssue} />}
 
       {issues.length === 0 ? (
         <EmptyNote text="Inga ärenden registrerade." />
@@ -1129,9 +1418,12 @@ function Arenden({ state, setState, scopedProps, allProperties, actor, notify })
             <div key={i.id} style={{ ...S.checklistCard, borderColor: i.priority === "Akut" ? "#C4171C" : "#C9C4B7" }}>
               <div style={S.checklistHead}>
                 <div>
-                  <div style={S.taskCardTitle}>{i.title}</div>
+                  <div style={S.taskCardTitle}>
+                    {i.title}
+                    {showPropertyTag && <span style={S.propertyTag}>{propName(i.propertyId)}</span>}
+                  </div>
                   <div style={S.taskCardProp}>
-                    {propName(i.propertyId)} · anmält {fmtDate(i.reportedAt)} av {i.reportedBy}
+                    Anmält {fmtDate(i.reportedAt)} av {i.reportedBy}
                   </div>
                   {i.description && <div style={{ ...S.rowSub, marginTop: 6 }}>{i.description}</div>}
                 </div>
@@ -1161,11 +1453,11 @@ function Arenden({ state, setState, scopedProps, allProperties, actor, notify })
   );
 }
 
-function IssueForm({ properties, defaultPropertyId, onSubmit }) {
+function IssueForm({ properties, onSubmit }) {
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
-  const [propertyId, setPropertyId] = useState(defaultPropertyId || properties[0]?.id);
   const [priority, setPriority] = useState("Normal");
+  const [propertyId, setPropertyId] = useState(properties[0]?.id || "");
 
   const submit = (e) => {
     e.preventDefault();
@@ -1180,14 +1472,7 @@ function IssueForm({ properties, defaultPropertyId, onSubmit }) {
           Vad är felet?
           <input className="fk-input" style={S.input} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="t.ex. Läckande diskmaskin" required />
         </label>
-        <label style={S.label}>
-          Fastighet
-          <select className="fk-input" style={S.input} value={propertyId} onChange={(e) => setPropertyId(e.target.value)}>
-            {properties.map((p) => (
-              <option key={p.id} value={p.id}>{p.name}</option>
-            ))}
-          </select>
-        </label>
+        <PropertyPicker properties={properties} value={propertyId} onChange={setPropertyId} />
       </div>
       <div style={S.formRow}>
         <label style={S.label}>
@@ -1208,18 +1493,11 @@ function IssueForm({ properties, defaultPropertyId, onSubmit }) {
   );
 }
 
-/* ------------------------------ debitering ------------------------------ */
+/* ------------------------------ billing actions (shared) ------------------------------ */
 
-function Debitering({ state, setState, scopedProps, allProperties, actor, notify }) {
-  const [showOrderForm, setShowOrderForm] = useState(false);
-  const [openOrderId, setOpenOrderId] = useState(null);
-  const [printingBasis, setPrintingBasis] = useState(null); // { basis, order }
-
-  const ids = new Set(scopedProps.map((p) => p.id));
-  const orders = (state.billableOrders || []).filter((o) => ids.has(o.propertyId));
+function createBillingActions(state, setState, actor, notify) {
   const timeEntries = state.billableTimeEntries || [];
   const invoiceBasis = state.invoiceBasis || [];
-  const propName = (id) => state.properties.find((p) => p.id === id)?.name || "";
 
   const entriesFor = (orderId) => timeEntries.filter((e) => e.orderId === orderId);
   const loggedHours = (orderId) => entriesFor(orderId).reduce((s, e) => s + Number(e.hours || 0), 0);
@@ -1228,18 +1506,37 @@ function Debitering({ state, setState, scopedProps, allProperties, actor, notify
       .filter((e) => !e.invoicedInBasisId)
       .reduce((s, e) => s + Number(e.hours || 0), 0);
 
-  const totalUnbilled = orders.reduce((s, o) => s + unbilledHours(o.id), 0);
-  const totalUnbilledAmount = orders.reduce(
-    (s, o) => s + unbilledHours(o.id) * Number(o.rate || 0),
-    0
-  );
+  const rateFor = (order) => {
+    const property = state.properties.find((p) => p.id === order.propertyId);
+    return Number(property?.rates?.[order.priceCategory] || 0);
+  };
 
-  const addOrder = (payload) => {
-    const order = { id: uid(), ...payload, status: "Öppen", createdAt: todayISO(), createdBy: actor || "Okänd" };
-    setState({ ...state, billableOrders: [...(state.billableOrders || []), order] });
-    setShowOrderForm(false);
-    setOpenOrderId(order.id);
-    notify("Ärende skapat");
+  const billRateFor = (order) => {
+    const property = state.properties.find((p) => p.id === order.propertyId);
+    return Number(property?.rates?.BIL || 0);
+  };
+
+  const addOrder = (type, payload) => {
+    const orderNumber = state.nextOrderNumber || 1;
+    const order = {
+      id: uid(),
+      ...payload,
+      type,
+      orderNumber,
+      status: "Pågår",
+      createdAt: todayISO(),
+      createdBy: actor || "Okänd",
+      completedAt: null,
+      billCount: Number(payload.billCount || 0),
+      billInvoicedInBasisId: null,
+    };
+    setState({
+      ...state,
+      billableOrders: [...(state.billableOrders || []), order],
+      nextOrderNumber: orderNumber + 1,
+    });
+    notify(type === "felanmalan" ? "Felanmälan registrerad" : "Tilläggstjänst registrerad");
+    return order;
   };
 
   const removeOrder = (id) => {
@@ -1249,13 +1546,27 @@ function Debitering({ state, setState, scopedProps, allProperties, actor, notify
       billableTimeEntries: timeEntries.filter((e) => e.orderId !== id),
       invoiceBasis: invoiceBasis.filter((b) => b.orderId !== id),
     });
-    if (openOrderId === id) setOpenOrderId(null);
   };
 
   const setOrderStatus = (order, status) => {
     setState({
       ...state,
-      billableOrders: state.billableOrders.map((o) => (o.id === order.id ? { ...o, status } : o)),
+      billableOrders: state.billableOrders.map((o) =>
+        o.id === order.id
+          ? { ...o, status, completedAt: status === "Klar" ? todayISO() : null }
+          : o
+      ),
+    });
+    if (status === "Klar") notify(`${order.title} klarmarkerad — flyttad till Debitering`);
+    else notify(`${order.title} återöppnad`);
+  };
+
+  const updateBillCount = (order, count) => {
+    setState({
+      ...state,
+      billableOrders: state.billableOrders.map((o) =>
+        o.id === order.id ? { ...o, billCount: Math.max(0, Number(count) || 0) } : o
+      ),
     });
   };
 
@@ -1270,6 +1581,7 @@ function Debitering({ state, setState, scopedProps, allProperties, actor, notify
 
   const createBasis = (order, adjustedHours, note) => {
     const unbilled = entriesFor(order.id).filter((e) => !e.invoicedInBasisId);
+    const includeBil = order.billCount > 0 && !order.billInvoicedInBasisId;
     const basisId = uid();
     const basis = {
       id: basisId,
@@ -1278,17 +1590,22 @@ function Debitering({ state, setState, scopedProps, allProperties, actor, notify
       title: order.title,
       createdAt: todayISO(),
       createdBy: actor || "Okänd",
-      rate: Number(order.rate || 0),
+      rate: rateFor(order),
       loggedHours: unbilled.reduce((s, e) => s + Number(e.hours || 0), 0),
       adjustedHours: Number(adjustedHours),
       note: note.trim(),
       entryIds: unbilled.map((e) => e.id),
+      billCount: includeBil ? order.billCount : 0,
+      billRate: includeBil ? billRateFor(order) : 0,
     };
     setState({
       ...state,
       invoiceBasis: [...invoiceBasis, basis],
       billableTimeEntries: timeEntries.map((e) =>
         unbilled.find((u) => u.id === e.id) ? { ...e, invoicedInBasisId: basisId } : e
+      ),
+      billableOrders: state.billableOrders.map((o) =>
+        o.id === order.id && includeBil ? { ...o, billInvoicedInBasisId: basisId } : o
       ),
     });
     notify("Faktureringsunderlag sparat");
@@ -1310,9 +1627,86 @@ function Debitering({ state, setState, scopedProps, allProperties, actor, notify
       billableTimeEntries: timeEntries.map((e) =>
         e.invoicedInBasisId === basis.id ? { ...e, invoicedInBasisId: null } : e
       ),
+      billableOrders: state.billableOrders.map((o) =>
+        o.billInvoicedInBasisId === basis.id ? { ...o, billInvoicedInBasisId: null } : o
+      ),
     });
     notify("Faktureringsunderlag borttaget, timmarna är öppna igen");
   };
+
+  return {
+    entriesFor,
+    loggedHours,
+    unbilledHours,
+    rateFor,
+    billRateFor,
+    addOrder,
+    removeOrder,
+    setOrderStatus,
+    updateBillCount,
+    addTimeEntry,
+    removeTimeEntry,
+    createBasis,
+    updateBasisHours,
+    removeBasis,
+  };
+}
+
+/* ------------------------------ debitering ------------------------------ */
+
+function Debitering({ state, scopedProps, billing, notify }) {
+  const [openOrderId, setOpenOrderId] = useState(null);
+  const [printingBasis, setPrintingBasis] = useState(null); // { basis, order }
+  const [sortBy, setSortBy] = useState("datum-senaste");
+  const [filterType, setFilterType] = useState("alla");
+  const [filterCategory, setFilterCategory] = useState("alla");
+  const [filterProperty, setFilterProperty] = useState("alla");
+
+  const ids = new Set(scopedProps.map((p) => p.id));
+  const showPropertyTag = scopedProps.length > 1;
+  const propName = (id) => state.properties.find((p) => p.id === id)?.name || "";
+  const orders = (state.billableOrders || []).filter((o) => ids.has(o.propertyId) && o.status === "Klar");
+  const invoiceBasis = state.invoiceBasis || [];
+  const propertyBasis = invoiceBasis.filter((b) => ids.has(b.propertyId));
+  const hasBasis = (orderId) => invoiceBasis.some((b) => b.orderId === orderId);
+
+  const filteredOrders = filterOrders(orders, { type: filterType, category: filterCategory }).filter(
+    (o) => filterProperty === "alla" || o.propertyId === filterProperty
+  );
+  const filteredOrderIds = new Set(filteredOrders.map((o) => o.id));
+  const toInvoice = filteredOrders.filter((o) => !hasBasis(o.id));
+  const alreadyInvoiced = filteredOrders.filter((o) => hasBasis(o.id));
+
+  const totalUnbilled = filteredOrders.reduce((s, o) => s + billing.unbilledHours(o.id), 0);
+  const totalUnbilledAmount = filteredOrders.reduce(
+    (s, o) => s + billing.unbilledHours(o.id) * billing.rateFor(o),
+    0
+  );
+
+  const filteredBasis = propertyBasis.filter((b) => filteredOrderIds.has(b.orderId));
+  const totalLogged = filteredBasis.reduce((s, b) => s + Number(b.loggedHours || 0), 0);
+  const totalInvoiced = filteredBasis.reduce((s, b) => s + Number(b.adjustedHours || 0), 0);
+  const writtenOff = Math.max(0, totalLogged - totalInvoiced);
+  const debiteringsgrad = totalLogged > 0 ? Math.round((totalInvoiced / totalLogged) * 1000) / 10 : null;
+  const filterActive = filterType !== "alla" || filterCategory !== "alla" || filterProperty !== "alla";
+
+  const loggedAmountKr = filteredBasis.reduce((s, b) => s + Number(b.loggedHours || 0) * Number(b.rate || 0), 0);
+  const invoicedAmountKr = filteredBasis.reduce((s, b) => s + Number(b.adjustedHours || 0) * Number(b.rate || 0), 0);
+  const writtenOffAmountKr = Math.max(0, loggedAmountKr - invoicedAmountKr);
+  const bilTotalKr = filteredBasis.reduce((s, b) => s + Number(b.billCount || 0) * Number(b.billRate || 0), 0);
+
+  const orderInvoicedAmount = (orderId) =>
+    invoiceBasis
+      .filter((b) => b.orderId === orderId)
+      .reduce(
+        (s, b) =>
+          s +
+          Number(b.adjustedHours || 0) * Number(b.rate || 0) +
+          Number(b.billCount || 0) * Number(b.billRate || 0),
+        0
+      );
+  const orderInvoicedHours = (orderId) =>
+    invoiceBasis.filter((b) => b.orderId === orderId).reduce((s, b) => s + Number(b.adjustedHours || 0), 0);
 
   const openOrder = openOrderId ? orders.find((o) => o.id === openOrderId) : null;
 
@@ -1323,6 +1717,7 @@ function Debitering({ state, setState, scopedProps, allProperties, actor, notify
         order={printingBasis.order}
         propertyName={propName(printingBasis.order.propertyId)}
         onClose={() => setPrintingBasis(null)}
+        notify={notify}
       />
     );
   }
@@ -1332,17 +1727,21 @@ function Debitering({ state, setState, scopedProps, allProperties, actor, notify
       <OrderDetail
         order={openOrder}
         propertyName={propName(openOrder.propertyId)}
-        entries={entriesFor(openOrder.id).sort((a, b) => (a.date < b.date ? 1 : -1))}
+        entries={billing.entriesFor(openOrder.id).sort((a, b) => (a.date < b.date ? 1 : -1))}
         basisList={invoiceBasis.filter((b) => b.orderId === openOrder.id).sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))}
-        loggedHours={loggedHours(openOrder.id)}
-        unbilledHours={unbilledHours(openOrder.id)}
+        loggedHours={billing.loggedHours(openOrder.id)}
+        unbilledHours={billing.unbilledHours(openOrder.id)}
+        rate={billing.rateFor(openOrder)}
+        bilRate={billing.billRateFor(openOrder)}
+        onUpdateBillCount={(count) => billing.updateBillCount(openOrder, count)}
+        allowInvoicing
         onBack={() => setOpenOrderId(null)}
-        onAddEntry={(payload) => addTimeEntry(openOrder, payload)}
-        onRemoveEntry={removeTimeEntry}
-        onSetStatus={(status) => setOrderStatus(openOrder, status)}
-        onCreateBasis={(hours, note) => createBasis(openOrder, hours, note)}
-        onUpdateBasisHours={updateBasisHours}
-        onRemoveBasis={removeBasis}
+        onAddEntry={(payload) => billing.addTimeEntry(openOrder, payload)}
+        onRemoveEntry={billing.removeTimeEntry}
+        onReopen={() => billing.setOrderStatus(openOrder, "Pågår")}
+        onCreateBasis={(hours, note) => billing.createBasis(openOrder, hours, note)}
+        onUpdateBasisHours={billing.updateBasisHours}
+        onRemoveBasis={billing.removeBasis}
         onPrintBasis={(basis) => setPrintingBasis({ basis, order: openOrder })}
       />
     );
@@ -1351,11 +1750,22 @@ function Debitering({ state, setState, scopedProps, allProperties, actor, notify
   return (
     <div style={{ animation: "fk-rise .25s ease" }}>
       <div style={S.sectionHead}>
-        <h2 style={S.h2}>Debiterbar tid utanför avtal</h2>
-        <button style={S.primaryBtn} className="fk-btn" onClick={() => setShowOrderForm((s) => !s)}>
-          {showOrderForm ? "Avbryt" : "+ Nytt ärende/order"}
-        </button>
+        <h2 style={S.h2}>Debitering</h2>
       </div>
+
+      {orders.length > 0 && (
+        <SortFilterBar
+          sortBy={sortBy}
+          setSortBy={setSortBy}
+          filterType={filterType}
+          setFilterType={setFilterType}
+          filterCategory={filterCategory}
+          setFilterCategory={setFilterCategory}
+          filterProperty={filterProperty}
+          setFilterProperty={setFilterProperty}
+          properties={scopedProps}
+        />
+      )}
 
       <div style={S.statGrid}>
         <div style={S.statCard}>
@@ -1367,47 +1777,293 @@ function Debitering({ state, setState, scopedProps, allProperties, actor, notify
           <div style={S.statLabel}>Ofakturerat belopp (ca)</div>
         </div>
         <div style={S.statCard}>
-          <div style={S.statValue}>{orders.length}</div>
-          <div style={S.statLabel}>Ärenden/order</div>
+          <div style={S.statValue}>{filteredOrders.length}</div>
+          <div style={S.statLabel}>Klarmarkerade ärenden</div>
         </div>
       </div>
 
-      {showOrderForm && (
-        <OrderForm properties={allProperties} defaultPropertyId={scopedProps[0]?.id} onSubmit={addOrder} />
+      <div style={S.panel}>
+        <h3 style={S.panelTitle}>Debiteringsgrad{filterActive ? " — filtrerat urval" : " — föreningen totalt"}</h3>
+        <div style={S.kpiRow}>
+          <div style={S.kpiBlock}>
+            <div style={S.kpiValue}>{totalLogged}</div>
+            <div style={S.kpiLabel}>Totalt registrerad tid (h)</div>
+          </div>
+          <div style={S.kpiBlock}>
+            <div style={{ ...S.kpiValue, color: "#2B6E5E" }}>{totalInvoiced}</div>
+            <div style={S.kpiLabel}>Fakturerad tid (h)</div>
+          </div>
+          <div style={S.kpiBlock}>
+            <div style={{ ...S.kpiValue, color: "#C4171C" }}>{writtenOff}</div>
+            <div style={S.kpiLabel}>Debiterad men ej fakturerad tid (h)</div>
+          </div>
+          <div style={S.kpiBlock}>
+            <div style={{ ...S.kpiValue, color: "#EA5B0C" }}>
+              {debiteringsgrad === null ? "–" : `${debiteringsgrad}%`}
+            </div>
+            <div style={S.kpiLabel}>Debiteringsgrad</div>
+          </div>
+        </div>
+
+        <div style={S.kpiDivider} />
+
+        <div style={S.kpiRow}>
+          <div style={S.kpiBlock}>
+            <div style={{ ...S.kpiValue, color: "#2B6E5E" }}>{invoicedAmountKr.toLocaleString("sv-SE")} kr</div>
+            <div style={S.kpiLabel}>Fakturerat belopp</div>
+          </div>
+          <div style={S.kpiBlock}>
+            <div style={{ ...S.kpiValue, color: "#C4171C" }}>{writtenOffAmountKr.toLocaleString("sv-SE")} kr</div>
+            <div style={S.kpiLabel}>Debiterbart men ej fakturerat belopp</div>
+          </div>
+          <div style={S.kpiBlock}>
+            <div style={{ ...S.kpiValue, color: "#1C2321" }}>{bilTotalKr.toLocaleString("sv-SE")} kr</div>
+            <div style={S.kpiLabel}>Totalt för Bil</div>
+          </div>
+        </div>
+
+        {totalLogged === 0 && (
+          <div style={{ ...S.rowSub, marginTop: 10 }}>
+            Nyckeltalen fylls i allt eftersom faktureringsunderlag skapas nedan.
+          </div>
+        )}
+      </div>
+
+
+      <h3 style={{ ...S.panelTitle, marginTop: 20 }}>Klarmarkerade ärenden att fakturera</h3>
+      {toInvoice.length === 0 ? (
+        <EmptyNote text={orders.length > 0 ? "Inga ärenden matchar filtret." : "Inga ärenden väntar på fakturaunderlag just nu."} />
+      ) : (
+        <div style={S.checklistStack}>
+          {sortOrders(toInvoice, sortBy, (o) => ({
+            date: o.completedAt,
+            hours: billing.loggedHours(o.id),
+            amount: billing.unbilledHours(o.id) * billing.rateFor(o),
+          })).map((o) => (
+            <DebiteringOrderCard
+              key={o.id}
+              order={o}
+              billing={billing}
+              propertyName={showPropertyTag ? propName(o.propertyId) : null}
+              onOpen={() => setOpenOrderId(o.id)}
+              onRemove={() => billing.removeOrder(o.id)}
+            />
+          ))}
+        </div>
+      )}
+
+      <h3 style={{ ...S.panelTitle, marginTop: 28 }}>Fakturerade ärenden</h3>
+      {alreadyInvoiced.length === 0 ? (
+        <EmptyNote text={orders.length > 0 ? "Inga ärenden matchar filtret." : "Inga fakturerade ärenden ännu. Ärenden hamnar här så fort ett faktureringsunderlag skapats."} />
+      ) : (
+        <div style={S.checklistStack}>
+          {sortOrders(alreadyInvoiced, sortBy, (o) => ({
+            date: o.completedAt,
+            hours: orderInvoicedHours(o.id),
+            amount: orderInvoicedAmount(o.id),
+          })).map((o) => (
+              <div key={o.id} style={S.checklistCardInvoiced}>
+                <div style={S.checklistHead}>
+                  <div>
+                    <div style={S.taskCardTitle}>
+                      <span style={S.orderNumberTag}>#{o.orderNumber}</span> {o.title}
+                      <span style={S.typeTag}>
+                        {o.type === "felanmalan" ? "Felanmälan" : "Tilläggstjänst"}
+                      </span>
+                      {showPropertyTag && <span style={S.propertyTag}>{propName(o.propertyId)}</span>}
+                    </div>
+                    <div style={S.taskCardProp}>
+                      Inkom {fmtDate(o.reportedDate)} · klarmarkerad {fmtDate(o.completedAt)}
+                    </div>
+                  </div>
+                  <button style={S.miniDelete} onClick={() => billing.removeOrder(o.id)} aria-label="Ta bort ärende">×</button>
+                </div>
+                <div style={S.issueFooter}>
+                  <span style={S.rowSub}>
+                    {orderInvoicedHours(o.id)} h fakturerat · {orderInvoicedAmount(o.id).toLocaleString("sv-SE")} kr
+                    {o.billCount > 0 && ` · 🚗 ${o.billCount} st`}
+                    {billing.unbilledHours(o.id) > 0 && ` · ${billing.unbilledHours(o.id)} h kvar att fakturera`}
+                  </span>
+                  <button style={S.stampBtn} className="fk-btn" onClick={() => setOpenOrderId(o.id)}>
+                    Visa underlag
+                  </button>
+                </div>
+              </div>
+            ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DebiteringOrderCard({ order: o, billing, propertyName, onOpen, onRemove }) {
+  const logged = billing.loggedHours(o.id);
+  const unbilled = billing.unbilledHours(o.id);
+  return (
+    <div style={S.checklistCardPending}>
+      <div style={S.checklistHead}>
+        <div>
+          <div style={S.taskCardTitle}>
+            <span style={S.orderNumberTag}>#{o.orderNumber}</span> {o.title}
+            <span style={S.typeTag}>{o.type === "felanmalan" ? "Felanmälan" : "Tilläggstjänst"}</span>
+            {propertyName && <span style={S.propertyTag}>{propertyName}</span>}
+          </div>
+          <div style={S.taskCardProp}>
+            Inkom {fmtDate(o.reportedDate)} · klarmarkerad {fmtDate(o.completedAt)}
+          </div>
+          {o.description && <div style={{ ...S.rowSub, marginTop: 6 }}>{o.description}</div>}
+        </div>
+        <button style={S.miniDelete} onClick={onRemove} aria-label="Ta bort ärende">×</button>
+      </div>
+      <div style={S.issueFooter}>
+        <span style={S.rowSub}>
+          {logged} h loggat · {unbilled} h att fakturera{o.priceCategory ? ` · ${o.priceCategory} (${billing.rateFor(o)} kr/h)` : ""}
+          {o.billCount > 0 && ` · 🚗 ${o.billCount} st`}
+        </span>
+        <button style={S.stampBtn} className="fk-btn" onClick={onOpen}>
+          Hantera fakturering
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------ felanmälan / tilläggstjänster (delad kö) ------------------------------ */
+
+function ArendeQueue({ type, title, newLabel, titleFieldLabel, titlePlaceholder, emptyText, state, scopedProps, billing, notify }) {
+  const [showForm, setShowForm] = useState(false);
+  const [openOrderId, setOpenOrderId] = useState(null);
+  const [printingBasis, setPrintingBasis] = useState(null);
+  const [sortBy, setSortBy] = useState("datum-senaste");
+  const [filterCategory, setFilterCategory] = useState("alla");
+  const [filterProperty, setFilterProperty] = useState("alla");
+
+  const ids = new Set(scopedProps.map((p) => p.id));
+  const showPropertyTag = scopedProps.length > 1;
+  const propName = (id) => state.properties.find((p) => p.id === id)?.name || "";
+  const invoiceBasis = state.invoiceBasis || [];
+  const allActiveOrders = (state.billableOrders || []).filter(
+    (o) => ids.has(o.propertyId) && o.type === type && o.status !== "Klar"
+  );
+  const orders = filterOrders(allActiveOrders, { category: filterCategory }).filter(
+    (o) => filterProperty === "alla" || o.propertyId === filterProperty
+  );
+
+  const addOrder = (payload) => {
+    billing.addOrder(type, payload);
+    setShowForm(false);
+  };
+
+  const openOrder = openOrderId ? orders.find((o) => o.id === openOrderId) : null;
+
+  if (printingBasis) {
+    return (
+      <PrintableBasis
+        basis={printingBasis.basis}
+        order={printingBasis.order}
+        propertyName={propName(printingBasis.order.propertyId)}
+        onClose={() => setPrintingBasis(null)}
+        notify={notify}
+      />
+    );
+  }
+
+  if (openOrder) {
+    return (
+      <OrderDetail
+        order={openOrder}
+        propertyName={propName(openOrder.propertyId)}
+        entries={billing.entriesFor(openOrder.id).sort((a, b) => (a.date < b.date ? 1 : -1))}
+        basisList={invoiceBasis.filter((b) => b.orderId === openOrder.id).sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))}
+        loggedHours={billing.loggedHours(openOrder.id)}
+        unbilledHours={billing.unbilledHours(openOrder.id)}
+        rate={billing.rateFor(openOrder)}
+        bilRate={billing.billRateFor(openOrder)}
+        onUpdateBillCount={(count) => billing.updateBillCount(openOrder, count)}
+        onBack={() => setOpenOrderId(null)}
+        onAddEntry={(payload) => billing.addTimeEntry(openOrder, payload)}
+        onRemoveEntry={billing.removeTimeEntry}
+        onComplete={() => {
+          billing.setOrderStatus(openOrder, "Klar");
+          setOpenOrderId(null);
+        }}
+        onCreateBasis={(hours, note) => billing.createBasis(openOrder, hours, note)}
+        onUpdateBasisHours={billing.updateBasisHours}
+        onRemoveBasis={billing.removeBasis}
+        onPrintBasis={(basis) => setPrintingBasis({ basis, order: openOrder })}
+      />
+    );
+  }
+
+  return (
+    <div style={{ animation: "fk-rise .25s ease" }}>
+      <div style={S.sectionHead}>
+        <h2 style={S.h2}>{title}</h2>
+        <button style={S.primaryBtn} className="fk-btn" onClick={() => setShowForm((s) => !s)}>
+          {showForm ? "Avbryt" : newLabel}
+        </button>
+      </div>
+
+      {showForm && (
+        <ArendeForm
+          properties={scopedProps}
+          nextOrderNumber={state.nextOrderNumber || 1}
+          titleFieldLabel={titleFieldLabel}
+          titlePlaceholder={titlePlaceholder}
+          onSubmit={addOrder}
+        />
+      )}
+
+      {allActiveOrders.length > 0 && (
+        <SortFilterBar
+          sortBy={sortBy}
+          setSortBy={setSortBy}
+          filterCategory={filterCategory}
+          setFilterCategory={setFilterCategory}
+          filterProperty={filterProperty}
+          setFilterProperty={setFilterProperty}
+          properties={scopedProps}
+        />
       )}
 
       {orders.length === 0 ? (
-        <EmptyNote text="Inga ärenden ännu. Skapa ett ärende/order för jobb utanför avtalet, och lägg sedan på tid allteftersom." />
+        <EmptyNote text={allActiveOrders.length > 0 ? "Inga ärenden matchar filtret." : emptyText} />
       ) : (
         <div style={S.checklistStack}>
-          {orders
-            .slice()
-            .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))
-            .map((o) => {
-              const logged = loggedHours(o.id);
-              const unbilled = unbilledHours(o.id);
+          {sortOrders(orders, sortBy, (o) => ({
+            date: o.reportedDate,
+            hours: billing.loggedHours(o.id),
+            amount: billing.loggedHours(o.id) * billing.rateFor(o),
+          })).map((o) => {
+              const logged = billing.loggedHours(o.id);
               return (
                 <div key={o.id} style={S.checklistCard}>
                   <div style={S.checklistHead}>
                     <div>
-                      <div style={S.taskCardTitle}>{o.title}</div>
-                      <div style={S.taskCardProp}>
-                        {propName(o.propertyId)} · skapad {fmtDate(o.createdAt)} av {o.createdBy}
+                      <div style={S.taskCardTitle}>
+                        <span style={S.orderNumberTag}>#{o.orderNumber}</span> {o.title}
+                        {showPropertyTag && <span style={S.propertyTag}>{propName(o.propertyId)}</span>}
                       </div>
+                      <div style={S.taskCardProp}>Inkom {fmtDate(o.reportedDate)}</div>
                       {o.description && <div style={{ ...S.rowSub, marginTop: 6 }}>{o.description}</div>}
                     </div>
-                    <button style={S.miniDelete} onClick={() => removeOrder(o.id)} aria-label="Ta bort ärende">×</button>
+                    <button style={S.miniDelete} onClick={() => billing.removeOrder(o.id)} aria-label="Ta bort">×</button>
                   </div>
                   <div style={S.issueFooter}>
                     <span style={S.rowSub}>
-                      {logged} h loggat · {unbilled} h att fakturera{o.rate ? ` · ${o.rate} kr/h` : ""}
+                      {logged} h loggat{o.priceCategory ? ` · ${o.priceCategory} (${billing.rateFor(o)} kr/h)` : ""}
+                      {o.billCount > 0 && ` · 🚗 ${o.billCount} st`}
                     </span>
                     <div style={{ display: "flex", gap: 8 }}>
-                      <span style={{ ...S.statusPill, ...(o.status === "Öppen" ? {} : S.statusPillActive) }}>
-                        {o.status}
-                      </span>
                       <button style={S.stampBtn} className="fk-btn" onClick={() => setOpenOrderId(o.id)}>
-                        Öppna tidrapport
+                        Öppna
+                      </button>
+                      <button
+                        style={S.primaryBtnSmall}
+                        className="fk-btn"
+                        onClick={() => billing.setOrderStatus(o, "Klar")}
+                      >
+                        Markera klar
                       </button>
                     </div>
                   </div>
@@ -1420,45 +2076,100 @@ function Debitering({ state, setState, scopedProps, allProperties, actor, notify
   );
 }
 
-function OrderForm({ properties, defaultPropertyId, onSubmit }) {
+function ArendeForm({ properties, nextOrderNumber, titleFieldLabel, titlePlaceholder, onSubmit }) {
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
-  const [propertyId, setPropertyId] = useState(defaultPropertyId || properties[0]?.id);
-  const [rate, setRate] = useState("");
+  const [priceCategory, setPriceCategory] = useState("FA");
+  const [reportedDate, setReportedDate] = useState(todayISO());
+  const [propertyId, setPropertyId] = useState(properties[0]?.id || "");
+  const [debiterBil, setDebiterBil] = useState(false);
+  const [billCount, setBillCount] = useState(1);
 
   const submit = (e) => {
     e.preventDefault();
     if (!title.trim() || !propertyId) return;
-    onSubmit({ title: title.trim(), description: description.trim(), propertyId, rate: rate ? Number(rate) : 0 });
+    onSubmit({
+      title: title.trim(),
+      description: description.trim(),
+      propertyId,
+      priceCategory,
+      reportedDate,
+      billCount: debiterBil ? Math.max(1, Number(billCount) || 1) : 0,
+    });
   };
 
   return (
     <form onSubmit={submit} style={S.formPanel}>
+      <div style={S.orderNumberPreview}>
+        <span style={S.orderNumberPreviewLabel}>Ordernummer</span>
+        <span style={S.orderNumberPreviewValue}>#{nextOrderNumber}</span>
+        <span style={S.rowSub}>tilldelas automatiskt när ärendet sparas</span>
+      </div>
+
       <div style={S.formRow}>
         <label style={S.label}>
-          Ärende/order
-          <input className="fk-input" style={S.input} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="t.ex. Stormröjning tak" required />
+          {titleFieldLabel}
+          <input className="fk-input" style={S.input} value={title} onChange={(e) => setTitle(e.target.value)} placeholder={titlePlaceholder} required />
+        </label>
+        <PropertyPicker properties={properties} value={propertyId} onChange={setPropertyId} />
+      </div>
+      <div style={S.formRow}>
+        <label style={S.label}>
+          Datum inkommen
+          <input className="fk-input" style={S.input} type="date" value={reportedDate} onChange={(e) => setReportedDate(e.target.value)} required />
         </label>
         <label style={S.label}>
-          Fastighet
-          <select className="fk-input" style={S.input} value={propertyId} onChange={(e) => setPropertyId(e.target.value)}>
-            {properties.map((p) => (
-              <option key={p.id} value={p.id}>{p.name}</option>
-            ))}
+          Kategori
+          <select className="fk-input" style={S.input} value={priceCategory} onChange={(e) => setPriceCategory(e.target.value)}>
+            <option value="FA">FA</option>
+            <option value="TEK">TEK</option>
           </select>
         </label>
       </div>
       <div style={S.formRow}>
         <label style={S.label}>
-          Timpris (kr, valfritt)
-          <input className="fk-input" style={S.input} type="number" min="0" value={rate} onChange={(e) => setRate(e.target.value)} placeholder="t.ex. 650" />
-        </label>
-        <label style={S.label}>
           Beskrivning
           <input className="fk-input" style={S.input} value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Valfritt" />
         </label>
       </div>
-      <button type="submit" style={S.primaryBtn} className="fk-btn">Skapa ärende</button>
+
+      <div style={S.bilRow}>
+        <label style={S.checkRow}>
+          <input
+            type="checkbox"
+            checked={debiterBil}
+            onChange={(e) => {
+              setDebiterBil(e.target.checked);
+              if (e.target.checked) setBillCount(1);
+            }}
+            style={S.checkbox}
+          />
+          Debitera bil
+        </label>
+        {debiterBil && (
+          <div style={S.bilStepper}>
+            <button
+              type="button"
+              onClick={() => setBillCount((c) => Math.max(1, c - 1))}
+              style={S.bilStepBtn}
+              aria-label="Färre bilar"
+            >
+              −
+            </button>
+            <span style={S.bilCount}>{billCount} {billCount === 1 ? "bil" : "bilar"}</span>
+            <button
+              type="button"
+              onClick={() => setBillCount((c) => c + 1)}
+              style={S.bilStepBtn}
+              aria-label="Fler bilar"
+            >
+              +
+            </button>
+          </div>
+        )}
+      </div>
+
+      <button type="submit" style={S.primaryBtn} className="fk-btn">Spara</button>
     </form>
   );
 }
@@ -1470,39 +2181,49 @@ function OrderDetail({
   basisList,
   loggedHours,
   unbilledHours,
+  rate,
+  bilRate,
+  allowInvoicing,
   onBack,
   onAddEntry,
   onRemoveEntry,
-  onSetStatus,
+  onComplete,
+  onReopen,
   onCreateBasis,
   onUpdateBasisHours,
   onRemoveBasis,
   onPrintBasis,
+  onUpdateBillCount,
 }) {
   const [showEntryForm, setShowEntryForm] = useState(false);
   const [showBasisForm, setShowBasisForm] = useState(false);
+  const bilLocked = !!order.billInvoicedInBasisId;
 
   return (
     <div style={{ animation: "fk-rise .25s ease" }}>
-      <button onClick={onBack} style={S.linkBtn}>‹ Alla ärenden</button>
+      <button onClick={onBack} style={S.linkBtn}>‹ Tillbaka</button>
 
       <div style={{ ...S.sectionHead, marginTop: 8 }}>
         <div>
-          <h2 style={S.h2}>{order.title}</h2>
-          <div style={S.taskCardProp}>{propertyName}{order.rate ? ` · ${order.rate} kr/h` : ""}</div>
+          <h2 style={S.h2}>
+            <span style={S.orderNumberTag}>#{order.orderNumber}</span> {order.title}
+            <span style={S.typeTag}>{order.type === "felanmalan" ? "Felanmälan" : "Tilläggstjänst"}</span>
+          </h2>
+          <div style={S.taskCardProp}>
+            {propertyName}{order.priceCategory ? ` · ${order.priceCategory} (${rate} kr/h)` : ""} · Inkom {fmtDate(order.reportedDate)}
+          </div>
           {order.description && <div style={{ ...S.rowSub, marginTop: 4 }}>{order.description}</div>}
         </div>
-        <div style={S.statusRow}>
-          {["Öppen", "Avslutad"].map((s) => (
-            <button
-              key={s}
-              onClick={() => onSetStatus(s)}
-              style={{ ...S.statusPill, ...(order.status === s ? S.statusPillActive : {}) }}
-            >
-              {s}
-            </button>
-          ))}
-        </div>
+        {onComplete && (
+          <button style={S.primaryBtnSmall} className="fk-btn" onClick={onComplete}>
+            Markera klar
+          </button>
+        )}
+        {onReopen && (
+          <button style={S.secondaryBtn} className="fk-btn" onClick={onReopen}>
+            Återöppna ärendet
+          </button>
+        )}
       </div>
 
       <div style={S.statGrid}>
@@ -1515,6 +2236,50 @@ function OrderDetail({
           <div style={S.statLabel}>Att fakturera (h)</div>
         </div>
       </div>
+
+      {onUpdateBillCount && (
+        <div style={{ ...S.panel, marginBottom: 18 }}>
+          <h3 style={S.panelTitle}>Bil</h3>
+          {bilLocked ? (
+            <div style={S.rowSub}>
+              🚗 {order.billCount} st redan inkluderat i ett faktureringsunderlag ({bilRate} kr/st) — låst.
+            </div>
+          ) : (
+            <div style={S.bilRow}>
+              <label style={S.checkRow}>
+                <input
+                  type="checkbox"
+                  checked={order.billCount > 0}
+                  onChange={(e) => onUpdateBillCount(e.target.checked ? 1 : 0)}
+                  style={S.checkbox}
+                />
+                Debitera bil ({bilRate} kr/st)
+              </label>
+              {order.billCount > 0 && (
+                <div style={S.bilStepper}>
+                  <button
+                    type="button"
+                    onClick={() => onUpdateBillCount(Math.max(1, order.billCount - 1))}
+                    style={S.bilStepBtn}
+                    aria-label="Färre bilar"
+                  >
+                    −
+                  </button>
+                  <span style={S.bilCount}>{order.billCount} {order.billCount === 1 ? "bil" : "bilar"}</span>
+                  <button
+                    type="button"
+                    onClick={() => onUpdateBillCount(order.billCount + 1)}
+                    style={S.bilStepBtn}
+                    aria-label="Fler bilar"
+                  >
+                    +
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       <div style={S.sectionHead}>
         <h3 style={S.panelTitle}>Tidrader</h3>
@@ -1554,62 +2319,73 @@ function OrderDetail({
         </div>
       )}
 
-      <div style={{ ...S.sectionHead, marginTop: 24 }}>
-        <h3 style={S.panelTitle}>Faktureringsunderlag</h3>
-        {unbilledHours > 0 && (
-          <button style={S.primaryBtnSmall} className="fk-btn" onClick={() => setShowBasisForm((s) => !s)}>
-            {showBasisForm ? "Avbryt" : "Skapa underlag"}
-          </button>
-        )}
-      </div>
+      {allowInvoicing && (
+        <>
+          <div style={{ ...S.sectionHead, marginTop: 24 }}>
+            <h3 style={S.panelTitle}>Faktureringsunderlag</h3>
+            {(unbilledHours > 0 || (order.billCount > 0 && !bilLocked)) && (
+              <button style={S.primaryBtnSmall} className="fk-btn" onClick={() => setShowBasisForm((s) => !s)}>
+                {showBasisForm ? "Avbryt" : "Skapa underlag"}
+              </button>
+            )}
+          </div>
 
-      {showBasisForm && (
-        <BasisForm
-          suggestedHours={unbilledHours}
-          onSubmit={(hours, note) => {
-            onCreateBasis(hours, note);
-            setShowBasisForm(false);
-          }}
-        />
-      )}
+          {showBasisForm && (
+            <BasisForm
+              suggestedHours={unbilledHours}
+              includesBil={order.billCount > 0 && !bilLocked}
+              bilCount={order.billCount}
+              bilRate={bilRate}
+              onSubmit={(hours, note) => {
+                onCreateBasis(hours, note);
+                setShowBasisForm(false);
+              }}
+            />
+          )}
 
-      {basisList.length === 0 ? (
-        <EmptyNote text="Inget faktureringsunderlag skapat ännu." />
-      ) : (
-        <div style={S.checklistStack}>
-          {basisList.map((b) => (
-            <div key={b.id} style={S.checklistCard}>
-              <div style={S.checklistHead}>
-                <div>
-                  <div style={S.taskCardTitle}>Underlag {fmtDate(b.createdAt)}</div>
-                  <div style={S.rowSub}>
-                    Loggat {b.loggedHours} h · av {b.createdBy}
+          {basisList.length === 0 ? (
+            <EmptyNote text="Inget faktureringsunderlag skapat ännu." />
+          ) : (
+            <div style={S.checklistStack}>
+              {basisList.map((b) => (
+                <div key={b.id} style={S.checklistCard}>
+                  <div style={S.checklistHead}>
+                    <div>
+                      <div style={S.taskCardTitle}>Underlag {fmtDate(b.createdAt)}</div>
+                      <div style={S.rowSub}>
+                        Loggat {b.loggedHours} h · av {b.createdBy}
+                        {b.billCount > 0 && ` · 🚗 ${b.billCount} st à ${b.billRate} kr`}
+                      </div>
+                      {b.note && <div style={{ ...S.rowSub, marginTop: 4 }}>{b.note}</div>}
+                    </div>
+                    <button style={S.miniDelete} onClick={() => onRemoveBasis(b)} aria-label="Ta bort underlag">×</button>
                   </div>
-                  {b.note && <div style={{ ...S.rowSub, marginTop: 4 }}>{b.note}</div>}
+                  <div style={S.issueFooter}>
+                    <label style={S.adjustRow}>
+                      Justerade timmar
+                      <input
+                        className="fk-input"
+                        style={S.adjustInput}
+                        type="number"
+                        step="0.25"
+                        min="0"
+                        value={b.adjustedHours}
+                        onChange={(e) => onUpdateBasisHours(b, e.target.value)}
+                      />
+                      <span style={S.rowSub}>
+                        × {b.rate} kr/h = {(b.adjustedHours * b.rate).toLocaleString("sv-SE")} kr
+                        {b.billCount > 0 && ` + ${(b.billCount * b.billRate).toLocaleString("sv-SE")} kr bil`}
+                      </span>
+                    </label>
+                    <button style={S.stampBtn} className="fk-btn" onClick={() => onPrintBasis(b)}>
+                      Öppna underlag
+                    </button>
+                  </div>
                 </div>
-                <button style={S.miniDelete} onClick={() => onRemoveBasis(b)} aria-label="Ta bort underlag">×</button>
-              </div>
-              <div style={S.issueFooter}>
-                <label style={S.adjustRow}>
-                  Justerade timmar
-                  <input
-                    className="fk-input"
-                    style={S.adjustInput}
-                    type="number"
-                    step="0.25"
-                    min="0"
-                    value={b.adjustedHours}
-                    onChange={(e) => onUpdateBasisHours(b, e.target.value)}
-                  />
-                  <span style={S.rowSub}>× {b.rate} kr/h = {(b.adjustedHours * b.rate).toLocaleString("sv-SE")} kr</span>
-                </label>
-                <button style={S.stampBtn} className="fk-btn" onClick={() => onPrintBasis(b)}>
-                  Öppna underlag
-                </button>
-              </div>
+              ))}
             </div>
-          ))}
-        </div>
+          )}
+        </>
       )}
     </div>
   );
@@ -1657,7 +2433,7 @@ function TimeEntryForm({ onSubmit }) {
   );
 }
 
-function BasisForm({ suggestedHours, onSubmit }) {
+function BasisForm({ suggestedHours, includesBil, bilCount, bilRate, onSubmit }) {
   const [hours, setHours] = useState(suggestedHours);
   const [note, setNote] = useState("");
 
@@ -1673,6 +2449,12 @@ function BasisForm({ suggestedHours, onSubmit }) {
         Timmar att fakturera just nu är föreslaget till {suggestedHours} h utifrån ej fakturerade tidrader.
         Justera vid behov, t.ex. för avrundning eller avdrag.
       </div>
+      {includesBil && (
+        <div style={{ ...S.rowSub, color: "#2B6E5E" }}>
+          🚗 {bilCount} {bilCount === 1 ? "bil" : "bilar"} á {bilRate} kr läggs automatiskt till i detta underlag
+          ({(bilCount * bilRate).toLocaleString("sv-SE")} kr).
+        </div>
+      )}
       <div style={S.formRow}>
         <label style={S.label}>
           Timmar till underlag
@@ -1697,14 +2479,147 @@ function BasisForm({ suggestedHours, onSubmit }) {
   );
 }
 
-function PrintableBasis({ basis, order, propertyName, onClose }) {
-  const amount = Number(basis.adjustedHours) * Number(basis.rate);
+/* ------------------------------ pdf-generering (faktureringsunderlag) ------------------------------ */
+
+function buildBasisPdf(basis, order, propertyName) {
+  const hoursAmount = Number(basis.adjustedHours) * Number(basis.rate);
+  const bilAmount = Number(basis.billCount || 0) * Number(basis.billRate || 0);
+  const amount = hoursAmount + bilAmount;
+
+  const doc = new jsPDF({ unit: "pt", format: "a4" });
+  const marginX = 48;
+  let y = 56;
+
+  // Stämpelmärke + rubrik
+  doc.setFillColor(28, 35, 33);
+  doc.roundedRect(marginX, y - 20, 34, 34, 4, 4, "F");
+  doc.setTextColor(234, 91, 12);
+  doc.setFontSize(11);
+  doc.setFont("helvetica", "bold");
+  doc.text("N2", marginX + 17, y - 1, { align: "center" });
+
+  doc.setTextColor(28, 35, 33);
+  doc.setFontSize(17);
+  doc.text("Faktureringsunderlag", marginX + 46, y - 4);
+  doc.setFont("helvetica", "normal");
+  doc.setFontSize(10);
+  doc.setTextColor(92, 89, 78);
+  doc.text(`Skapat ${fmtDate(basis.createdAt)} av ${basis.createdBy}`, marginX + 46, y + 12);
+
+  y += 44;
+  doc.setDrawColor(201, 196, 183);
+  doc.line(marginX, y, 595 - marginX, y);
+  y += 24;
+
+  const metaCol = (label, value, x) => {
+    doc.setFontSize(8.5);
+    doc.setTextColor(92, 89, 78);
+    doc.text(label.toUpperCase(), x, y);
+    doc.setFontSize(11.5);
+    doc.setTextColor(28, 35, 33);
+    doc.setFont("helvetica", "bold");
+    doc.text(String(value), x, y + 15);
+    doc.setFont("helvetica", "normal");
+  };
+  metaCol("Bostadsrättsförening", propertyName, marginX);
+  metaCol("Ordernummer", `#${order.orderNumber}`, marginX + 210);
+  metaCol("Ärende/order", order.title, marginX + 330);
+
+  y += 40;
+
+  const rows = [
+    [
+      `${order.title}${basis.note ? ` — ${basis.note}` : ""}`,
+      `${basis.adjustedHours} h`,
+      `${basis.rate} kr/h`,
+      `${hoursAmount.toLocaleString("sv-SE")} kr`,
+    ],
+  ];
+  if (basis.billCount > 0) {
+    rows.push(["Bil", `${basis.billCount} st`, `${basis.billRate} kr/st`, `${bilAmount.toLocaleString("sv-SE")} kr`]);
+  }
+
+  autoTable(doc, {
+    startY: y,
+    margin: { left: marginX, right: marginX },
+    head: [["Beskrivning", "Antal", "Pris", "Summa"]],
+    body: rows,
+    styles: { font: "helvetica", fontSize: 10, textColor: [28, 35, 33], cellPadding: 8 },
+    headStyles: { fillColor: [255, 255, 255], textColor: [92, 89, 78], fontStyle: "bold", lineWidth: { bottom: 1 }, lineColor: [28, 35, 33] },
+    theme: "plain",
+  });
+
+  const afterTableY = doc.lastAutoTable.finalY + 24;
+  doc.setFontSize(13);
+  doc.setFont("helvetica", "bold");
+  doc.text(`Totalt: ${amount.toLocaleString("sv-SE")} kr`, 595 - marginX, afterTableY, { align: "right" });
+
+  if (basis.loggedHours !== basis.adjustedHours) {
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9.5);
+    doc.setTextColor(92, 89, 78);
+    doc.text(
+      `(Loggad tid var ${basis.loggedHours} h, justerad till ${basis.adjustedHours} h.)`,
+      marginX,
+      afterTableY + 20
+    );
+  }
+
+  return doc;
+}
+
+function basisPdfFilename(basis, order) {
+  return `faktureringsunderlag-order-${order.orderNumber}-${basis.createdAt}.pdf`;
+}
+
+function PrintableBasis({ basis, order, propertyName, onClose, notify }) {
+  const [sending, setSending] = useState(false);
+  const hoursAmount = Number(basis.adjustedHours) * Number(basis.rate);
+  const bilAmount = Number(basis.billCount || 0) * Number(basis.billRate || 0);
+  const amount = hoursAmount + bilAmount;
+
+  const downloadPdf = () => {
+    const doc = buildBasisPdf(basis, order, propertyName);
+    doc.save(basisPdfFilename(basis, order));
+  };
+
+  const sendByEmail = async () => {
+    setSending(true);
+    try {
+      const doc = buildBasisPdf(basis, order, propertyName);
+      const pdfBase64 = doc.output("datauristring").split(",")[1];
+      const filename = basisPdfFilename(basis, order);
+      const { data, error } = await supabase.functions.invoke("send-invoice-email", {
+        body: {
+          subject: `Faktureringsunderlag — order #${order.orderNumber} — ${propertyName}`,
+          filename,
+          pdfBase64,
+        },
+      });
+      if (error || data?.error) {
+        throw new Error(error?.message || data?.error || "Okänt fel");
+      }
+      notify?.("Faktureringsunderlag skickat via e-post");
+    } catch (err) {
+      console.error("Kunde inte skicka e-post:", err);
+      notify?.("Kunde inte skicka e-post — kontrollera serverfunktionen och försök igen");
+    } finally {
+      setSending(false);
+    }
+  };
+
   return (
     <div style={{ animation: "fk-rise .25s ease" }}>
-      <div style={{ display: "flex", gap: 10, marginBottom: 16 }} className="fk-no-print">
+      <div style={{ display: "flex", gap: 10, marginBottom: 16, flexWrap: "wrap" }} className="fk-no-print">
         <button onClick={onClose} style={S.linkBtn}>‹ Tillbaka</button>
-        <button onClick={() => window.print()} style={S.primaryBtn} className="fk-btn">
-          Skriv ut / Spara som PDF
+        <button onClick={downloadPdf} style={S.primaryBtn} className="fk-btn">
+          Ladda ner PDF
+        </button>
+        <button onClick={() => window.print()} style={S.secondaryBtn} className="fk-btn">
+          Skriv ut
+        </button>
+        <button onClick={sendByEmail} style={S.primaryBtnSmall} className="fk-btn" disabled={sending}>
+          {sending ? "Skickar…" : "Skicka via e-post"}
         </button>
       </div>
 
@@ -1719,8 +2634,12 @@ function PrintableBasis({ basis, order, propertyName, onClose }) {
 
         <div style={S.invoiceMetaGrid}>
           <div>
-            <div style={S.invoiceMetaLabel}>Fastighet</div>
+            <div style={S.invoiceMetaLabel}>Bostadsrättsförening</div>
             <div style={S.invoiceMetaValue}>{propertyName}</div>
+          </div>
+          <div>
+            <div style={S.invoiceMetaLabel}>Ordernummer</div>
+            <div style={S.invoiceMetaValue}>#{order.orderNumber}</div>
           </div>
           <div>
             <div style={S.invoiceMetaLabel}>Ärende/order</div>
@@ -1732,8 +2651,8 @@ function PrintableBasis({ basis, order, propertyName, onClose }) {
           <thead>
             <tr>
               <th style={S.invoiceTh}>Beskrivning</th>
-              <th style={S.invoiceTh}>Timmar</th>
-              <th style={S.invoiceTh}>Timpris</th>
+              <th style={S.invoiceTh}>Antal</th>
+              <th style={S.invoiceTh}>Pris</th>
               <th style={S.invoiceTh}>Summa</th>
             </tr>
           </thead>
@@ -1742,8 +2661,16 @@ function PrintableBasis({ basis, order, propertyName, onClose }) {
               <td style={S.invoiceTd}>{order.title}{basis.note ? ` — ${basis.note}` : ""}</td>
               <td style={S.invoiceTd}>{basis.adjustedHours} h</td>
               <td style={S.invoiceTd}>{basis.rate} kr/h</td>
-              <td style={S.invoiceTd}>{amount.toLocaleString("sv-SE")} kr</td>
+              <td style={S.invoiceTd}>{hoursAmount.toLocaleString("sv-SE")} kr</td>
             </tr>
+            {basis.billCount > 0 && (
+              <tr>
+                <td style={S.invoiceTd}>Bil</td>
+                <td style={S.invoiceTd}>{basis.billCount} st</td>
+                <td style={S.invoiceTd}>{basis.billRate} kr/st</td>
+                <td style={S.invoiceTd}>{bilAmount.toLocaleString("sv-SE")} kr</td>
+              </tr>
+            )}
           </tbody>
         </table>
 
@@ -1767,7 +2694,7 @@ function Backup({ state, setState, notify, lastSavedAt }) {
   const fileInputRef = React.useRef(null);
 
   const counts = {
-    Fastigheter: state.properties.length,
+    Bostadsrättsföreningar: state.properties.length,
     Uppgifter: state.tasks.length,
     Checklistor: state.checklistTemplates.length,
     Ärenden: state.issues.length,
@@ -1803,7 +2730,7 @@ function Backup({ state, setState, notify, lastSavedAt }) {
           throw new Error("Filen innehåller inte ett igenkännbart N2 Förvaltning-underlag.");
         }
         const summary = {
-          Fastigheter: data.properties?.length || 0,
+          Bostadsrättsföreningar: data.properties?.length || 0,
           Uppgifter: data.tasks?.length || 0,
           Checklistor: data.checklistTemplates?.length || 0,
           Ärenden: data.issues?.length || 0,
@@ -1860,7 +2787,7 @@ function Backup({ state, setState, notify, lastSavedAt }) {
       <div style={S.panel}>
         <h3 style={S.panelTitle}>Ladda ner backup</h3>
         <p style={{ ...S.rowSub, marginBottom: 12 }}>
-          Sparar all information (fastigheter, uppgifter, checklistor, ärenden, debitering) som en
+          Sparar all information (bostadsrättsföreningar, uppgifter, checklistor, ärenden, debitering) som en
           JSON-fil på din enhet.
         </p>
         <button style={S.primaryBtn} className="fk-btn" onClick={downloadBackup}>
@@ -2088,6 +3015,47 @@ const S = {
     fontSize: 13,
     width: 130,
   },
+  addPropertyBtn: {
+    background: "transparent",
+    color: "#EA5B0C",
+    border: "1px solid #EA5B0C",
+    borderRadius: 6,
+    padding: "8px 12px",
+    fontSize: 13,
+    fontWeight: 600,
+    whiteSpace: "nowrap",
+  },
+  modalBackdrop: {
+    position: "fixed",
+    inset: 0,
+    background: "rgba(28, 35, 33, 0.55)",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 18,
+    zIndex: 50,
+  },
+  modalPanel: {
+    background: "#EDEAE1",
+    borderRadius: 10,
+    padding: 22,
+    width: "100%",
+    maxWidth: 560,
+    maxHeight: "88vh",
+    overflowY: "auto",
+    position: "relative",
+    animation: "fk-rise .2s ease",
+  },
+  modalClose: {
+    position: "absolute",
+    top: 12,
+    right: 14,
+    border: "none",
+    background: "transparent",
+    fontSize: 22,
+    lineHeight: 1,
+    color: "#5C594E",
+  },
   tabRow: {
     display: "flex",
     gap: 4,
@@ -2162,6 +3130,8 @@ const S = {
 
   checklistStack: { display: "flex", flexDirection: "column", gap: 12 },
   checklistCard: { background: "#FFFFFF", border: "1.5px solid #C9C4B7", borderRadius: 8, padding: 16 },
+  checklistCardPending: { background: "#FFFDF3", border: "1.5px solid #F0E4A8", borderRadius: 8, padding: 16 },
+  checklistCardInvoiced: { background: "#F5FBF6", border: "1.5px solid #C3E4C6", borderRadius: 8, padding: 16 },
   checklistHead: { display: "flex", justifyContent: "space-between", gap: 10 },
   runBox: { marginTop: 12, paddingTop: 12, borderTop: "1px dashed #C9C4B7", display: "flex", flexDirection: "column", gap: 8 },
   checkRow: { display: "flex", alignItems: "center", gap: 8, fontSize: 13.5 },
@@ -2178,6 +3148,85 @@ const S = {
   secondaryBtn: { background: "transparent", color: "#5C594E", border: "1px solid #C9C4B7", borderRadius: 6, padding: "9px 14px", fontSize: 13.5, fontWeight: 600 },
   linkBtn: { background: "transparent", border: "none", color: "#EA5B0C", fontSize: 12.5, fontWeight: 600, padding: "4px 0", textAlign: "left" },
   filterRow: { display: "flex", gap: 6, marginBottom: 12 },
+  sortFilterBar: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 14,
+    alignItems: "flex-end",
+    background: "#FFFFFF",
+    border: "1px solid #C9C4B7",
+    borderRadius: 8,
+    padding: "12px 14px",
+    marginBottom: 16,
+  },
+  sortFilterField: { display: "flex", flexDirection: "column", gap: 4, minWidth: 160 },
+  sortFilterLabel: { fontSize: 10.5, color: "#5C594E", textTransform: "uppercase", letterSpacing: 0.5 },
+  sortFilterSelect: { border: "1px solid #C9C4B7", borderRadius: 6, padding: "7px 9px", fontSize: 13, color: "#1C2321", background: "#FBFAF7" },
+  summaryTable: { borderCollapse: "collapse", width: "100%", fontSize: 13 },
+  summaryTh: { textAlign: "left", padding: "6px 12px 6px 0", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, color: "#5C594E", borderBottom: "1.5px solid #1C2321" },
+  summaryTd: { padding: "8px 12px 8px 0", borderBottom: "1px solid #C9C4B7", fontWeight: 500 },
+
+  typeTag: {
+    marginLeft: 10,
+    fontSize: 10.5,
+    fontWeight: 600,
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+    color: "#5C594E",
+    background: "#EDEAE1",
+    border: "1px solid #C9C4B7",
+    borderRadius: 4,
+    padding: "2px 8px",
+    verticalAlign: "middle",
+  },
+  propertyTag: {
+    marginLeft: 10,
+    fontSize: 10.5,
+    fontWeight: 600,
+    color: "#2B6E5E",
+    background: "#E9F4EA",
+    border: "1px solid #C3E4C6",
+    borderRadius: 4,
+    padding: "2px 8px",
+    verticalAlign: "middle",
+  },
+  orderNumberTag: {
+    fontFamily: "'IBM Plex Mono', monospace",
+    fontSize: "0.85em",
+    fontWeight: 600,
+    color: "#EA5B0C",
+    marginRight: 2,
+  },
+  orderNumberPreview: {
+    display: "flex",
+    alignItems: "baseline",
+    gap: 8,
+    background: "#EDEAE1",
+    border: "1px dashed #C9C4B7",
+    borderRadius: 6,
+    padding: "10px 14px",
+    marginBottom: 4,
+  },
+  orderNumberPreviewLabel: { fontSize: 11.5, color: "#5C594E", textTransform: "uppercase", letterSpacing: 0.5 },
+  orderNumberPreviewValue: { fontFamily: "'IBM Plex Mono', monospace", fontSize: 17, fontWeight: 700, color: "#EA5B0C" },
+  bilRow: { display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" },
+  bilStepper: { display: "flex", alignItems: "center", gap: 10 },
+  bilStepBtn: {
+    width: 28,
+    height: 28,
+    borderRadius: 6,
+    border: "1px solid #C9C4B7",
+    background: "#FBFAF7",
+    fontSize: 16,
+    lineHeight: 1,
+    color: "#1C2321",
+  },
+  bilCount: { fontSize: 13.5, fontWeight: 600, minWidth: 56, textAlign: "center" },
+  kpiRow: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 14 },
+  kpiBlock: { textAlign: "center" },
+  kpiValue: { fontFamily: "'IBM Plex Mono', monospace", fontSize: 22, fontWeight: 600, color: "#1C2321" },
+  kpiLabel: { fontSize: 11.5, color: "#5C594E", marginTop: 4 },
+  kpiDivider: { height: 1, background: "#C9C4B7", margin: "18px 0" },
 
   contactRow: { display: "flex", flexWrap: "wrap", gap: 8, alignItems: "baseline", fontSize: 12.5 },
   contactRole: { fontSize: 10.5, textTransform: "uppercase", letterSpacing: 0.5, color: "#5C594E", background: "#EDEAE1", padding: "2px 7px", borderRadius: 4, flexShrink: 0 },
@@ -2191,7 +3240,7 @@ const S = {
 
   invoiceDoc: { background: "#FFFFFF", border: "1px solid #C9C4B7", borderRadius: 8, padding: 28, maxWidth: 640, margin: "0 auto" },
   invoiceHeader: { display: "flex", alignItems: "center", gap: 14, marginBottom: 24, paddingBottom: 16, borderBottom: "2px solid #1C2321" },
-  invoiceMetaGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 22 },
+  invoiceMetaGrid: { display: "grid", gridTemplateColumns: "1.4fr 0.8fr 1.4fr", gap: 16, marginBottom: 22 },
   invoiceMetaLabel: { fontSize: 10.5, textTransform: "uppercase", letterSpacing: 0.6, color: "#8a8578" },
   invoiceMetaValue: { fontSize: 14, fontWeight: 600, marginTop: 2 },
   invoiceTable: { width: "100%", borderCollapse: "collapse", fontSize: 13 },

@@ -9,3 +9,4 @@ Kortversion:
 4. Skapa GitHub-repo, pusha koden.
 5. Koppla repot till Vercel, lägg in samma miljövariabler där, deploya.
 6. Öppna länken på iPhone i Safari → dela-ikonen → "Lägg till på hemskärmen".
+Uppdaterad.

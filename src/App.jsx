@@ -174,6 +174,9 @@ const normalizeOrder = (o) => ({
   cancelledAt: o.cancelledAt || null,
   cancelledReason: o.cancelledReason || null,
   cancelledBy: o.cancelledBy || null,
+  reporterName: o.reporterName || "",
+  reporterContact: o.reporterContact || "",
+  reporterAddress: o.reporterAddress || "",
 });
 
 const normalize = (loaded) => {
@@ -328,6 +331,13 @@ export default function App() {
     return () => listener.subscription.unsubscribe();
   }, []);
 
+  // Publik felanmälningssida — ingen inloggning, ingen del av resten av appen.
+  // Byggd som en enkel sökvägskontroll istället för ett helt routing-bibliotek,
+  // eftersom det bara är den här enda publika sidan som behövs.
+  if (typeof window !== "undefined" && window.location.pathname.replace(/\/+$/, "") === "/felanmalan") {
+    return <PublicFelanmalanForm />;
+  }
+
   if (session === undefined) {
     return (
       <div style={S.loadingScreen}>
@@ -342,6 +352,248 @@ export default function App() {
   }
 
   return <AuthenticatedApp session={session} />;
+}
+
+function PublicFelanmalanForm() {
+  const forceredPropertyId = new URLSearchParams(window.location.search).get("forening") || "";
+  const [propertyName, setPropertyName] = useState(null); // null = laddar, "" = okänd/saknas
+  const [loadError, setLoadError] = useState(null);
+  const [category, setCategory] = useState(""); // "" | "felanmalan" | "ovrigt"
+  const [title, setTitle] = useState("");
+  const [description, setDescription] = useState("");
+  const [reporterName, setReporterName] = useState("");
+  const [reporterAddress, setReporterAddress] = useState("");
+  const [reporterContact, setReporterContact] = useState("");
+  const [honeypot, setHoneypot] = useState(""); // dolt fält — bara robotar fyller i det
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState(null);
+  const [done, setDone] = useState(false);
+
+  useEffect(() => {
+    if (!forceredPropertyId) {
+      setPropertyName("");
+      return;
+    }
+    supabase.functions
+      .invoke("list-properties", { method: "GET" })
+      .then(({ data, error }) => {
+        if (error || !data?.properties) {
+          setLoadError("Kunde inte kontrollera föreningen. Ladda om sidan, eller kontakta förvaltaren direkt.");
+          return;
+        }
+        const match = data.properties.find((p) => p.id === forceredPropertyId);
+        setPropertyName(match ? match.name : "");
+      })
+      .catch(() => setLoadError("Kunde inte kontrollera föreningen. Ladda om sidan, eller kontakta förvaltaren direkt."));
+  }, [forceredPropertyId]);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (
+      !forceredPropertyId ||
+      !category ||
+      !title.trim() ||
+      !reporterAddress.trim() ||
+      !reporterName.trim() ||
+      !reporterContact.trim() ||
+      !description.trim()
+    ) {
+      return;
+    }
+    setSubmitting(true);
+    setSubmitError(null);
+    try {
+      const { data, error } = await supabase.functions.invoke("submit-felanmalan", {
+        body: {
+          propertyId: forceredPropertyId,
+          category,
+          title: title.trim(),
+          description: description.trim(),
+          reporterName: reporterName.trim(),
+          reporterContact: reporterContact.trim(),
+          reporterAddress: reporterAddress.trim(),
+          honeypot,
+        },
+      });
+      if (error || data?.error) {
+        throw new Error(error?.message || data?.error || "Okänt fel");
+      }
+      setDone(true);
+    } catch (err) {
+      console.error("Kunde inte skicka felanmälan:", err);
+      setSubmitError("Kunde inte skicka in felanmälan just nu. Försök igen om en liten stund.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  if (done) {
+    return (
+      <div style={S.loginScreen}>
+        <style>{FONT_IMPORT}</style>
+        <div style={S.loginPanel}>
+          <div style={{ textAlign: "center", marginBottom: 18 }}>
+            <img src="/n2-logo-full.png" alt="N2 Fastighetsservice och Förvaltning AB" style={S.loginLogo} />
+          </div>
+          <div style={{ ...S.taskCardTitle, fontSize: 17, textAlign: "center" }}>
+            {category === "felanmalan" ? "Tack, din felanmälan är mottagen!" : "Tack, ditt ärende är mottaget!"}
+          </div>
+          <div style={{ ...S.rowSub, marginTop: 10, textAlign: "center" }}>
+            Vi återkommer om vi behöver mer information. Du behöver inte göra något mer just nu.
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={S.loginScreen}>
+      <style>{FONT_IMPORT}</style>
+      <form onSubmit={submit} style={{ ...S.loginPanel, maxWidth: 420 }}>
+        <div style={{ textAlign: "center", marginBottom: 22 }}>
+          <img src="/n2-logo-full.png" alt="N2 Fastighetsservice och Förvaltning AB" style={S.loginLogo} />
+        </div>
+        <div style={{ ...S.taskCardTitle, fontSize: 16, marginBottom: 14 }}>Kontakta föreningen</div>
+
+        {loadError && <div style={{ color: "#C4171C", fontSize: 13, marginBottom: 14 }}>{loadError}</div>}
+
+        {!forceredPropertyId && propertyName !== null && (
+          <div style={{ ...S.rowSub, textAlign: "center" }}>
+            Den här länken saknar uppgift om vilken förening felanmälan gäller.
+            Använd den specifika länken eller QR-koden för din bostadsrättsförening
+            — kontakta din förvaltare om du är osäker på vilken det är.
+          </div>
+        )}
+
+        {forceredPropertyId && propertyName === "" && !loadError && (
+          <div style={{ ...S.rowSub, textAlign: "center", color: "#C4171C" }}>
+            Kunde inte hitta föreningen för den här länken. Kontakta din förvaltare.
+          </div>
+        )}
+
+        {forceredPropertyId && propertyName && (
+          <>
+            <div style={{ ...S.rowSub, marginBottom: 14 }}>
+              Du kontaktar: <strong style={{ color: "#1C2321" }}>{propertyName}</strong>
+            </div>
+
+            <label style={S.label}>
+              <span>Kategori <span style={{ color: "#C4171C" }}>*</span></span>
+              <select
+                className="fk-input"
+                style={{ ...S.input, color: category === "" ? "#8a8578" : "#1C2321" }}
+                value={category}
+                onChange={(e) => setCategory(e.target.value)}
+                required
+              >
+                <option value="" disabled style={{ color: "#8a8578" }}>Välj kontaktorsak</option>
+                <option value="felanmalan" style={{ color: "#1C2321" }}>Felanmälan</option>
+                <option value="ovrigt" style={{ color: "#1C2321" }}>Övriga ärenden</option>
+              </select>
+            </label>
+
+            <label style={{ ...S.label, marginTop: 10 }}>
+              <span>{category === "ovrigt" ? "Vad gäller ärendet?" : "Vad är felet?"} <span style={{ color: "#C4171C" }}>*</span></span>
+              <input
+                className="fk-input"
+                style={S.input}
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
+                placeholder={category === "ovrigt" ? "t.ex. Fråga om parkering" : "t.ex. Läckande kran i tvättstugan"}
+                required
+              />
+            </label>
+
+            <label style={{ ...S.label, marginTop: 10 }}>
+              <span>Adress / lägenhet <span style={{ color: "#C4171C" }}>*</span></span>
+              <input
+                className="fk-input"
+                style={S.input}
+                value={reporterAddress}
+                onChange={(e) => setReporterAddress(e.target.value)}
+                placeholder="t.ex. Kvarngatan 4, lägenhet 1203"
+                required
+              />
+            </label>
+
+            <label style={{ ...S.label, marginTop: 10 }}>
+              <span>Beskrivning <span style={{ color: "#C4171C" }}>*</span></span>
+              <textarea
+                className="fk-input"
+                style={{ ...S.input, height: 90, resize: "vertical" }}
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                placeholder={
+                  category === "ovrigt"
+                    ? "Beskriv ditt ärende så utförligt du kan"
+                    : "Berätta gärna mer, t.ex. var i huset och sedan när"
+                }
+                required
+              />
+            </label>
+
+            <label style={{ ...S.label, marginTop: 10 }}>
+              <span>Ditt namn <span style={{ color: "#C4171C" }}>*</span></span>
+              <input
+                className="fk-input"
+                style={S.input}
+                value={reporterName}
+                onChange={(e) => setReporterName(e.target.value)}
+                required
+              />
+            </label>
+
+            <label style={{ ...S.label, marginTop: 10 }}>
+              <span>Telefonnummer <span style={{ color: "#C4171C" }}>*</span></span>
+              <input
+                className="fk-input"
+                style={S.input}
+                type="tel"
+                value={reporterContact}
+                onChange={(e) => setReporterContact(e.target.value)}
+                placeholder="t.ex. 070-123 45 67"
+                required
+              />
+            </label>
+
+            {/* Dold fälla för robotar — riktiga besökare ser och fyller aldrig i detta */}
+            <input
+              type="text"
+              value={honeypot}
+              onChange={(e) => setHoneypot(e.target.value)}
+              autoComplete="off"
+              tabIndex={-1}
+              style={{ position: "absolute", left: "-9999px", width: 1, height: 1, opacity: 0 }}
+              aria-hidden="true"
+            />
+
+            {submitError && <div style={{ color: "#C4171C", fontSize: 13, marginTop: 12 }}>{submitError}</div>}
+
+            <button
+              type="submit"
+              style={{ ...S.addBtn, marginTop: 18, width: "100%" }}
+              className="fk-btn"
+              disabled={
+                submitting ||
+                !category ||
+                !title.trim() ||
+                !reporterAddress.trim() ||
+                !reporterName.trim() ||
+                !reporterContact.trim() ||
+                !description.trim()
+              }
+            >
+              {submitting ? "Skickar…" : category === "felanmalan" ? "Skicka felanmälan" : "Skicka ärende"}
+            </button>
+          </>
+        )}
+
+        {propertyName === null && !loadError && (
+          <div style={{ ...S.rowSub, textAlign: "center" }}>Laddar…</div>
+        )}
+      </form>
+    </div>
+  );
 }
 
 function LoginScreen() {
@@ -923,6 +1175,15 @@ function Oversikt({ state, scopedProps, selectedProperty, setTab, onEditProperty
 
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [notesExpanded, setNotesExpanded] = useState(false);
+  const [linkCopied, setLinkCopied] = useState(false);
+
+  const copyFelanmalanLink = (propertyId) => {
+    const link = `${window.location.origin}/felanmalan?forening=${propertyId}`;
+    navigator.clipboard.writeText(link).then(() => {
+      setLinkCopied(true);
+      setTimeout(() => setLinkCopied(false), 2200);
+    });
+  };
 
   return (
     <div style={{ animation: "fk-rise .25s ease" }}>
@@ -951,6 +1212,22 @@ function Oversikt({ state, scopedProps, selectedProperty, setTab, onEditProperty
               ) : (
                 <button style={S.miniDelete} onClick={() => setConfirmingDelete(true)} aria-label="Ta bort förening">×</button>
               )}
+            </div>
+          </div>
+
+          <div style={S.runBox}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+              <span style={S.rowSub}>
+                Felanmälan-länk för boende (använd för QR-kod i trapphuset):
+              </span>
+              <button
+                type="button"
+                style={S.secondaryBtnSmall}
+                className="fk-btn"
+                onClick={() => copyFelanmalanLink(selectedProperty.id)}
+              >
+                {linkCopied ? "Kopierad!" : "Kopiera länk"}
+              </button>
             </div>
           </div>
 
@@ -1524,7 +1801,17 @@ function Arenden({ state, setState, scopedProps, actor, notify }) {
                   <div style={S.taskCardProp}>
                     Anmält {fmtDate(i.reportedAt)} av {i.reportedBy}
                   </div>
+                  {i.reporterAddress && (
+                    <div style={{ ...S.rowSub, marginTop: 4 }}>
+                      <strong style={{ color: "#1C2321" }}>Adress:</strong> {i.reporterAddress}
+                    </div>
+                  )}
                   {i.description && <div style={{ ...S.rowSub, marginTop: 6 }}>{i.description}</div>}
+                  {(i.reporterName || i.reporterContact) && (
+                    <div style={{ ...S.rowSub, marginTop: 4, fontStyle: "italic" }}>
+                      Anmält av: {[i.reporterName, i.reporterContact].filter(Boolean).join(" · ")}
+                    </div>
+                  )}
                 </div>
                 <button style={S.miniDelete} onClick={() => removeIssue(i.id)} aria-label="Ta bort ärende">×</button>
               </div>
@@ -2174,7 +2461,17 @@ function ArendeQueue({ type, title, newLabel, titleFieldLabel, titlePlaceholder,
               {showPropertyTag && <span style={S.propertyTag}>{propName(o.propertyId)}</span>}
             </div>
             <div style={S.taskCardProp}>Inkom {fmtDate(o.reportedDate)}</div>
+            {o.reporterAddress && (
+              <div style={{ ...S.rowSub, marginTop: 4 }}>
+                <strong style={{ color: "#1C2321" }}>Adress:</strong> {o.reporterAddress}
+              </div>
+            )}
             {o.description && <div style={{ ...S.rowSub, marginTop: 6 }}>{o.description}</div>}
+            {(o.reporterName || o.reporterContact) && (
+              <div style={{ ...S.rowSub, marginTop: 4, fontStyle: "italic" }}>
+                Anmält av: {[o.reporterName, o.reporterContact].filter(Boolean).join(" · ")}
+              </div>
+            )}
           </div>
         </div>
 
@@ -2424,7 +2721,17 @@ function OrderDetail({
           <div style={S.taskCardProp}>
             {propertyName}{order.priceCategory ? ` · ${order.priceCategory} (${rate} kr/h)` : ""} · Inkom {fmtDate(order.reportedDate)}
           </div>
+          {order.reporterAddress && (
+            <div style={{ ...S.rowSub, marginTop: 4 }}>
+              <strong style={{ color: "#1C2321" }}>Adress:</strong> {order.reporterAddress}
+            </div>
+          )}
           {order.description && <div style={{ ...S.rowSub, marginTop: 4 }}>{order.description}</div>}
+          {(order.reporterName || order.reporterContact) && (
+            <div style={{ ...S.rowSub, marginTop: 4, fontStyle: "italic" }}>
+              Anmält av: {[order.reporterName, order.reporterContact].filter(Boolean).join(" · ")}
+            </div>
+          )}
         </div>
         {!readOnly && onComplete && (
           <button style={S.primaryBtnSmall} className="fk-btn" onClick={onComplete}>

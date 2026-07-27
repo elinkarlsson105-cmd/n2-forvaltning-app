@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback, useMemo, useRef } from "react"
 import { supabase } from "./lib/supabaseClient";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
+import * as XLSX from "xlsx";
 
 // Logga (byggnadsikon + "N2") inbäddad som base64 för användning i genererade PDF:er,
 // så genereringen fungerar offline utan extra nätverksanrop.
@@ -93,7 +94,7 @@ function SortFilterBar({
       </label>
       {setFilterProperty && properties && properties.length > 1 && (
         <label style={S.sortFilterField}>
-          <span style={S.sortFilterLabel}>Bostadsrättsförening</span>
+          <span style={S.sortFilterLabel}>Fastighet</span>
           <select className="fk-input" style={S.sortFilterSelect} value={filterProperty} onChange={(e) => setFilterProperty(e.target.value)}>
             <option value="alla">Alla</option>
             {properties.map((p) => (
@@ -124,10 +125,43 @@ function SortFilterBar({
   );
 }
 
-const seedState = () => ({
+const seedState = () => {
+  const orgA = uid();
+  const orgB = uid();
+  return {
+  // FÖRENINGEN = avtalsparten. Styrelse, e-postadress för rapportutskick,
+  // timpriser och avtalsnivå hör hit. En förening har en eller flera fastigheter.
+  organizations: [
+    {
+      id: orgA,
+      name: "BRF Kvarnen",
+      orgnr: "",
+      email: "",
+      kontaktperson: "",
+      avtalsniva: "Standard",
+      notes: "",
+      contacts: [],
+      rates: { FA: 0, TEK: 0, BIL: 0 },
+    },
+    {
+      id: orgB,
+      name: "BRF Ekbacken",
+      orgnr: "",
+      email: "",
+      kontaktperson: "",
+      avtalsniva: "Standard",
+      notes: "",
+      contacts: [],
+      rates: { FA: 0, TEK: 0, BIL: 0 },
+    },
+  ],
+  // FASTIGHETEN = byggnaden. Atemp, mätvärden och driftdata hör hit, eftersom
+  // det är den nivån nyckeltalen faktiskt beräknas på. Föreningsvyn summerar
+  // fastigheterna — den lagrar ingenting eget.
   properties: [
     {
       id: uid(),
+      orgId: orgA,
       name: "Kvarngatan 4",
       address: "Kvarngatan 4, 112 20 Stockholm",
       notes: "",
@@ -136,6 +170,7 @@ const seedState = () => ({
     },
     {
       id: uid(),
+      orgId: orgB,
       name: "Ekbacken 12",
       address: "Ekbacken 12, 141 41 Huddinge",
       notes: "",
@@ -151,15 +186,99 @@ const seedState = () => ({
   billableTimeEntries: [],
   invoiceBasis: [],
   nextOrderNumber: 1,
+  utilityReports: [],
+  // Graddagar (gemensam serie för alla föreningar): { "2026-01": { faktisk, normal } }.
+  // Används för normalårskorrigering av fjärrvärmen i driftanalysen.
+  klimatdata: {},
+  // Logg över skickade driftrapporter:
+  // { id, propertyId, orgId, scope, omfattning, typ, period, datum, av }
+  // — så man alltid kan se när en förening senast fick sin rapport, och om den
+  // gällde ett enskilt hus eller hela föreningen.
+  rapportlogg: [],
+  };
+};
+
+const AVTALSNIVAER = ["Standard", "Plus"];
+
+const normalizeOrganization = (o) => ({
+  ...o,
+  name: o.name || "",
+  orgnr: o.orgnr || "",
+  // Rapportmottagare: hit går driftrapporten när den skickas till styrelsen.
+  email: o.email || "",
+  kontaktperson: o.kontaktperson || "",
+  // Standard = kvartalsrapport till styrelsen. Plus = månadsvis driftstatus.
+  avtalsniva: AVTALSNIVAER.includes(o.avtalsniva) ? o.avtalsniva : "Standard",
+  notes: o.notes || "",
+  contacts: Array.isArray(o.contacts) ? o.contacts : [],
+  rates: {
+    FA: Number(o.rates?.FA || 0),
+    TEK: Number(o.rates?.TEK || 0),
+    BIL: Number(o.rates?.BIL || 0),
+  },
+  // ENERGIN LIGGER PÅ FÖRENINGEN. Det finns en avläsning per energislag och
+  // månad för hela föreningen — även när mätarna sitter i olika byggnader.
+  // Därför beräknas Q/W, kWh/m² och normalårskorrigering en enda gång, här.
+  //
+  // Atemp för hela föreningen (nämnaren i kWh/m²). Anges direkt eller räknas
+  // ut från BOA/LOA — samma sak oavsett hur många hus föreningen har.
+  atemp: Number(o.atemp || 0),
+  boa: Number(o.boa || 0),
+  loa: Number(o.loa || 0),
+  biytor: Number(o.biytor || 0),
+  atempMode: o.atempMode === "beraknad" ? "beraknad" : "manual",
+  // Antal lägenheter och boende — referensdata för nyckeltal (t.ex.
+  // liter varmvatten/kallvatten per person och dygn).
+  antalLgh: Number(o.antalLgh || 0),
+  antalBoende: Number(o.antalBoende || 0),
+  // Föreningens adresser. Har föreningen flera hus är det just adresserna som
+  // skiljer dem åt — ingen egen byggnadsenhet behövs för det.
+  addresses: Array.isArray(o.addresses) ? o.addresses : [],
+  // Varmvatten: auto (skattas från sommarmånaderna) eller manuellt bastal.
+  vvAuto: o.vvAuto !== false,
+  vvBastal: Number(o.vvBastal || 0),
+  // Egen graddagsserie när föreningen har annan fjärrvärmeleverantör än de övriga.
+  useOwnKlimat: !!o.useOwnKlimat,
+  klimatdata: o.klimatdata || {},
+  // Var mätarna sitter. Rent referensinformation för dig som är ute och läser av
+  // — den påverkar ingen beräkning, eftersom avläsningen ändå är en per förening.
+  matarplatser: o.matarplatser || {},
 });
+
+// Föreningens uppvärmda area: summan av fastigheternas Atemp, om du inte angett
+// en total direkt på föreningen. Detta är nämnaren i kWh/m².
+function orgAtemp(state, org) {
+  return Number(org?.atemp || 0);
+}
+
+// Fastigheter som saknar Atemp gör föreningens kWh/m² för högt, eftersom energin
+// finns i täljaren men arean saknas i nämnaren. Därför flaggas de.
+
 
 const normalizeProperty = (p) => ({
   ...p,
+  // Vilken förening fastigheten tillhör. Sätts automatiskt av migreringen i
+  // normalize() för data som skapades innan föreningslagret fanns.
+  orgId: p.orgId || null,
   rates: {
     FA: Number(p.rates?.FA || 0),
     TEK: Number(p.rates?.TEK || 0),
     BIL: Number(p.rates?.BIL || 0),
   },
+  // Atemp (uppvärmd area, m²) — krävs för energiindex kWh/m² i driftanalysen.
+  atemp: Number(p.atemp || 0),
+  // Underlag för Atemp-beräkningen (sparas så de kan justeras senare):
+  // BOA = boarea, LOA = lokalarea, biytor = övriga uppvärmda ytor (trapphus,
+  // källare, garage ≥ 10 °C). Saknas biytor används Boverkets schablon
+  // Atemp ≈ 1,25 × (BOA + LOA) för flerbostadshus.
+  boa: Number(p.boa || 0),
+  loa: Number(p.loa || 0),
+  biytor: Number(p.biytor || 0),
+  atempMode: p.atempMode === "beraknad" ? "beraknad" : "manual",
+  // OBS: varmvattenbastal och graddagsserie ligger på FÖRENINGEN, inte här.
+  // Det finns en fjärrvärmeavläsning per förening, så normalårskorrigeringen
+  // görs en gång — inte en gång per byggnad. Fälten läses ändå ut vid
+  // migreringen, därför lämnas de kvar orörda på gamla poster.
 });
 
 const normalizeOrder = (o) => ({
@@ -174,10 +293,144 @@ const normalizeOrder = (o) => ({
   cancelledAt: o.cancelledAt || null,
   cancelledReason: o.cancelledReason || null,
   cancelledBy: o.cancelledBy || null,
+  // Händelselogg: klarmarkering och återöppning (med orsak). Återöppning av
+  // ett klarmarkerat ärende kräver en kommentar som sparas här.
+  logg: Array.isArray(o.logg) ? o.logg : [],
   reporterName: o.reporterName || "",
   reporterContact: o.reporterContact || "",
   reporterAddress: o.reporterAddress || "",
 });
+
+// Normaliserar en mätarlista (vatten eller el). Faller tillbaka på det gamla
+// enskilda mätarfältet (t.ex. waterMeterNr/water) om listan saknas, så att
+// äldre rapporter migreras automatiskt utan att någon avläsning tappas. Rader
+// helt utan både nummer och värde rensas bort.
+const normalizeMeters = (list, legacyNr, legacyValue) => {
+  const hasLegacy = legacyNr || (legacyValue != null && legacyValue !== "");
+  const source = Array.isArray(list) && list.length
+    ? list
+    : hasLegacy
+    ? [{ nr: legacyNr, value: legacyValue }]
+    : [];
+  return source
+    .map((m) => ({
+      id: m.id || uid(),
+      nr: (m.nr || "").toString(),
+      value: m.value === "" || m.value == null ? null : Number(m.value),
+    }))
+    .filter((m) => m.nr !== "" || m.value != null);
+};
+
+const normalizeUtilityReport = (r) => ({
+  ...r,
+  // Avläsningen gäller HELA föreningen — en rapport per månad, oavsett hur
+  // många byggnader föreningen har eller var mätarna råkar sitta.
+  orgId: r.orgId || null,
+  // Vatten- och elmätare lagras som LISTOR — en förening kan ha flera mätare
+  // (t.ex. Övre/Undre vattenmätare, eller en elmätare per byggnad). Varje
+  // mätare har ett nummer och en mätarställning (det absoluta värdet på
+  // mätaren). Förbrukningen lagras INTE utan tas fram automatiskt som
+  // mellanskillnaden mot SAMMA mätare föregående månad — se meterConsumption().
+  // Man fyller alltså bara i en siffra per mätare och månad, men får både
+  // ställning och förbrukning. Äldre rapporter med ett enda water/electricity-
+  // fält migreras automatiskt in i listan av normalizeMeters().
+  waterMeters: normalizeMeters(r.waterMeters, r.waterMeterNr, r.water),
+  elMeters: normalizeMeters(r.elMeters, r.electricityMeterNr, r.electricity),
+  // Fjärrvärme från energibolaget (t.ex. Sundsvall Energi). OBS: till skillnad
+  // från mätarställningarna ovan är detta FÖRBRUKNING per månad, direkt från
+  // faktura/portal — MWh (energi) och m³ (flöde). Ur dessa räknar
+  // driftanalysen automatiskt fram Q/W (m³/MWh), kWh/m² (mot Atemp) och
+  // normalårskorrigerad förbrukning (mot graddagarna).
+  dhMwh: r.dhMwh === "" || r.dhMwh == null ? null : Number(r.dhMwh),
+  dhM3: r.dhM3 === "" || r.dhM3 == null ? null : Number(r.dhM3),
+  // Undercentralens egen driftrapport (den handskrivna blanketten från
+  // fjärrvärmecentralen) — avläst PÅ PLATS, till skillnad från dhMwh/dhM3 som
+  // kommer från energibolagets faktura. dhMeterMwh/dhMeterM3 är mätarställningar
+  // (kumulativa) precis som water/electricity/heating ovan, så förbrukningen
+  // räknas ut automatiskt via utilityConsumption() och kan stämmas av mot fakturan.
+  dhMeterNr: r.dhMeterNr || "",
+  dhMeterMwh: r.dhMeterMwh === "" || r.dhMeterMwh == null ? null : Number(r.dhMeterMwh),
+  dhMeterM3: r.dhMeterM3 === "" || r.dhMeterM3 == null ? null : Number(r.dhMeterM3),
+  dhFramledn: r.dhFramledn === "" || r.dhFramledn == null ? null : Number(r.dhFramledn),
+  dhReturledn: r.dhReturledn === "" || r.dhReturledn == null ? null : Number(r.dhReturledn),
+  dhUtetemp: r.dhUtetemp === "" || r.dhUtetemp == null ? null : Number(r.dhUtetemp),
+  dhKl: r.dhKl || "",
+  radFramledn: r.radFramledn === "" || r.radFramledn == null ? null : Number(r.radFramledn),
+  radReturledn: r.radReturledn === "" || r.radReturledn == null ? null : Number(r.radReturledn),
+  tappvattenTemp: r.tappvattenTemp === "" || r.tappvattenTemp == null ? null : Number(r.tappvattenTemp),
+  expansionTryck: r.expansionTryck || "",
+  paafyllt: r.paafyllt || "",
+  // Till styrelserapporten: vad som gjorts under månaden och vad som rekommenderas.
+  utfort: r.utfort || "",
+  atgard: r.atgard || "",
+  note: r.note || "",
+  // Klarmarkering: rapporten är ett justerbart utkast tills den klarmarkeras.
+  // Först då kan den skickas/laddas ner, och raden visas ljusgrön.
+  klar: !!r.klar,
+  klarAt: r.klarAt || null,
+  klarAv: r.klarAv || null,
+  // Händelselogg för klarmarkering: varje klarmarkering OCH upplåsning loggas
+  // med datum och person, så det alltid går att se om en färdig rapport
+  // låsts upp i efterhand. [{ datum, av, handelse }]
+  laslogg: Array.isArray(r.laslogg) ? r.laslogg : [],
+});
+
+// Räknar ut förbrukningen för en viss mätartyp ("water"/"electricity"/"heating")
+// för en given rapport, som mellanskillnaden mot närmast föregående månads
+// mätarställning för samma förening och mätare. Returnerar null om det saknas
+// en tidigare avläsning att jämföra med.
+function utilityConsumption(allReports, report, field) {
+  const current = report[field];
+  if (current == null) return null;
+  const previous = allReports
+    .filter((r) => r.orgId === report.orgId && r.month < report.month && r[field] != null)
+    .sort((a, b) => (a.month < b.month ? 1 : -1))[0];
+  if (!previous) return null;
+  return Math.round((current - previous[field]) * 100) / 100;
+}
+
+// Förbrukning för EN mätare i en rapport = skillnaden mot samma mätare i
+// närmast föregående månad för föreningen. Mätare matchas i första hand på
+// nummer (robust mellan månader även om ordningen ändras), annars på position
+// i listan. Returnerar null om det saknas en tidigare avläsning att jämföra mot.
+function meterConsumption(allReports, report, kind, meter, index) {
+  if (!meter || meter.value == null) return null;
+  const prev = allReports
+    .filter(
+      (r) =>
+        r.orgId === report.orgId &&
+        r.month < report.month &&
+        Array.isArray(r[kind]) &&
+        r[kind].length
+    )
+    .sort((a, b) => (a.month < b.month ? 1 : -1))[0];
+  if (!prev) return null;
+  let match = null;
+  if (meter.nr) match = prev[kind].find((m) => m.nr && m.nr === meter.nr);
+  if (!match) match = prev[kind][index];
+  if (!match || match.value == null) return null;
+  return Math.round((meter.value - match.value) * 100) / 100;
+}
+
+// Summerad förbrukning för alla mätare av ett slag ("waterMeters"/"elMeters")
+// i en rapport. Returnerar null om ingen mätare kan jämföras mot förra månaden.
+function metersTotalConsumption(allReports, report, kind) {
+  const meters = Array.isArray(report[kind]) ? report[kind] : [];
+  let sum = null;
+  meters.forEach((m, i) => {
+    const c = meterConsumption(allReports, report, kind, m, i);
+    if (c != null) sum = (sum || 0) + c;
+  });
+  return sum == null ? null : Math.round(sum * 100) / 100;
+}
+
+// Summerad mätarställning (Summa-raden i formulär och rapport).
+function metersTotalValue(report, kind) {
+  const meters = Array.isArray(report[kind]) ? report[kind] : [];
+  const vals = meters.map((m) => m.value).filter((v) => v != null);
+  if (!vals.length) return null;
+  return Math.round(vals.reduce((a, v) => a + v, 0) * 100) / 100;
+}
 
 const normalize = (loaded) => {
   const orders = (loaded.billableOrders || []).map(normalizeOrder);
@@ -188,16 +441,315 @@ const normalize = (loaded) => {
     counter += 1;
     return numbered;
   });
+  let organizations = (loaded.organizations || []).map(normalizeOrganization);
+  let properties = (loaded.properties || seedState().properties).map(normalizeProperty);
+
+  // ENGÅNGSMIGRERING. Innan föreningslagret fanns var varje post i appen både
+  // avtalspart och byggnad. Här skapas en förening per befintlig post, och
+  // fastigheten kopplas dit. Ingen data går förlorad — har en förening flera
+  // hus flyttar du bara fastigheterna till rätt förening efteråt (Föreningar →
+  // Flytta fastighet) och raderar de tomma föreningarna.
+  if (organizations.length === 0 && properties.length > 0) {
+    organizations = properties.map((p) =>
+      normalizeOrganization({
+        id: `org-${p.id}`,
+        name: p.name,
+        email: (p.contacts || []).find((c) => c.email)?.email || "",
+        kontaktperson: (p.contacts || []).find((c) => c.name)?.name || "",
+        contacts: p.contacts || [],
+        rates: p.rates,
+      })
+    );
+    properties = properties.map((p) => ({ ...p, orgId: `org-${p.id}` }));
+    // Energiinställningarna satt tidigare på posten. De följer med till
+    // föreningen, som numera är nivån all energiuppföljning sker på.
+    const propById = new Map(properties.map((p) => [`org-${p.id}`, p]));
+    organizations = organizations.map((o) => {
+      const src = propById.get(o.id);
+      if (!src) return o;
+      return {
+        ...o,
+        vvAuto: src.vvAuto !== false,
+        vvBastal: Number(src.vvBastal || 0),
+        useOwnKlimat: !!src.useOwnKlimat,
+        klimatdata: src.klimatdata || {},
+        // Area och adress hörde tidigare till posten. De hör hemma på
+        // föreningen nu, eftersom det är den nivå energin följs upp på.
+        atemp: Number(src.atemp || 0),
+        boa: Number(src.boa || 0),
+        loa: Number(src.loa || 0),
+        biytor: Number(src.biytor || 0),
+        atempMode: src.atempMode === "beraknad" ? "beraknad" : "manual",
+        address: src.address || "",
+        addresses: src.address ? [{ id: `adr-${src.id}`, text: src.address }] : [],
+      };
+    });
+  }
+
+  // Befintliga driftrapporter pekade på en fastighet. De flyttas till den
+  // fastighetens förening. Eftersom migreringen ger en förening per gammal post
+  // kan två rapporter aldrig krocka på samma månad här.
+  const orgIdByProp = new Map(properties.map((p) => [p.id, p.orgId]));
+  const reports = (loaded.utilityReports || []).map(normalizeUtilityReport).map((r) =>
+    r.orgId ? r : { ...r, orgId: orgIdByProp.get(r.propertyId) || null }
+  );
+
+  // Skyddsnät: en fastighet utan giltig förening ska aldrig försvinna ur vyn.
+  // Den hamnar i en synlig uppsamlingsförening i stället.
+  const orgIds = new Set(organizations.map((o) => o.id));
+  const orphanIds = new Set(
+    properties.filter((p) => !p.orgId || !orgIds.has(p.orgId)).map((p) => p.id)
+  );
+  if (orphanIds.size > 0) {
+    const fallbackId = "org-utan-forening";
+    if (!orgIds.has(fallbackId)) {
+      organizations = [
+        ...organizations,
+        normalizeOrganization({ id: fallbackId, name: "Ej kopplade fastigheter" }),
+      ];
+    }
+    properties = properties.map((p) =>
+      orphanIds.has(p.id) ? { ...p, orgId: fallbackId } : p
+    );
+  }
+
   return {
     ...seedState(),
     ...loaded,
-    properties: (loaded.properties || seedState().properties).map(normalizeProperty),
+    organizations,
+    properties,
     billableOrders: numberedOrders,
     billableTimeEntries: loaded.billableTimeEntries || [],
     invoiceBasis: loaded.invoiceBasis || [],
     nextOrderNumber: counter,
+    utilityReports: reports,
+    klimatdata: loaded.klimatdata || {},
+    rapportlogg: loaded.rapportlogg || [],
   };
 };
+
+/* ------------------------------ driftanalys: beräkningar ------------------------------ */
+
+// Graddagar för en viss månad och förening. Normalt används den gemensamma
+// serien (state.klimatdata) — men om föreningen har en annan leverantör och
+// "egen graddagsserie" är påslagen används föreningens egen serie i stället.
+function klimatForMonth(state, org, ym) {
+  const src = org?.useOwnKlimat ? org.klimatdata : state.klimatdata;
+  const k = src?.[ym];
+  if (!k) return null;
+  const faktisk = Number(k.faktisk);
+  const normal = Number(k.normal);
+  if (!(faktisk > 0) || !(normal > 0)) return null;
+  return { faktisk, normal };
+}
+
+// Hittar samma förenings rapport för samma månad föregående år (för jämförelser).
+function reportPrevYear(allReports, report) {
+  const [y, m] = report.month.split("-");
+  const target = `${Number(y) - 1}-${m}`;
+  return allReports.find((r) => r.orgId === report.orgId && r.month === target) || null;
+}
+
+// Alla fjärrvärme-nyckeltal för en månadsrapport. Q/W normalårskorrigeras
+// medvetet INTE — det är ett driftmått (avkylning) — medan energin (MWh,
+// kWh/m²) korrigeras mot graddagarna så att år blir jämförbara oavsett väder.
+// Varmvattnets bastal (MWh/månad) för en förening. Tappvarmvattnet är i
+// stort sett konstant över året och HELT oberoende av vädret — därför ska
+// det hållas utanför graddagskorrigeringen. Bastalet skattas bäst från
+// sommarmånaderna (jun–aug), då nästan ingen uppvärmning sker och nästan
+// hela förbrukningen är varmvatten. Alternativt anges det manuellt.
+// Fjärrvärmens "effektiva" förbrukning för en månad: i första hand
+// energibolagets faktura (dhMwh/dhM3, om ifyllt), annars beräknad förbrukning
+// från undercentralens EGNA mätarställning (dhMeterMwh/dhMeterM3 — samma
+// differensberäkning som vatten/el/värme). Det gör att hela analysen
+// (Q/W, kWh/m², normalårskorrigering, Flerårsöversikten) fungerar även om man
+// bara läser av undercentralen på plats och inte har fakturauppgifter.
+// Returnerar null om ingen av källorna ger något värde att räkna på.
+function dhEffective(allReports, report) {
+  if (!report) return null;
+  const mwh = report.dhMwh != null ? report.dhMwh : utilityConsumption(allReports, report, "dhMeterMwh");
+  if (mwh == null) return null;
+  const m3 = report.dhM3 != null ? report.dhM3 : utilityConsumption(allReports, report, "dhMeterM3");
+  return { mwh, m3 };
+}
+
+function varmvattenBas(allReports, org) {
+  if (!org) return 0;
+  if (org.vvAuto === false) return org.vvBastal || 0;
+  const sommar = (allReports || [])
+    .filter((r) => r.orgId === org.id && ["06", "07", "08"].includes(r.month.slice(5, 7)))
+    .map((r) => dhEffective(allReports, r))
+    .filter((e) => e != null);
+  if (sommar.length === 0) return org.vvBastal || 0;
+  return sommar.reduce((a, e) => a + e.mwh, 0) / sommar.length;
+}
+
+function dhKpis(state, allReports, org, report) {
+  const eff = dhEffective(allReports, report);
+  if (!eff) return null;
+  const { mwh, m3 } = eff;
+  const klimat = klimatForMonth(state, org, report.month);
+  // Korrekt normalårskorrigering: endast UPPVÄRMNINGSDELEN korrigeras mot
+  // graddagarna — varmvattnet (bastalet) läggs tillbaka okorrigerat.
+  //   E_korr = E_vv + (E_total − E_vv) × (GD_normal / GD_faktisk)
+  const vv = Math.min(varmvattenBas(allReports, org), mwh);
+  const uppv = mwh - vv;
+  const korr = klimat ? vv + uppv * (klimat.normal / klimat.faktisk) : null;
+  const summaAtemp = orgAtemp(state, org);
+  const atemp = summaAtemp > 0 ? summaAtemp : null;
+  return {
+    mwh,
+    m3,
+    klimat,
+    vv,
+    uppv,
+    qw: m3 != null && mwh > 0 ? m3 / mwh : null,
+    korr,
+    kwhm2: atemp ? (mwh * 1000) / atemp : null,
+    kwhm2Korr: korr != null && atemp ? (korr * 1000) / atemp : null,
+  };
+}
+
+// Timpris för en fastighet: föreningens avtal gäller, men en enskild fastighet
+// kan ha ett eget pris (t.ex. en lokaldel med annan överenskommelse). Egen
+// nollställd taxa = ärv föreningens.
+function rateFor(state, property, key) {
+  const own = Number(property?.rates?.[key] || 0);
+  if (own > 0) return own;
+  const org = (state?.organizations || []).find((o) => o.id === property?.orgId);
+  return Number(org?.rates?.[key] || 0);
+}
+
+const pctDiff = (now, before) =>
+  now == null || before == null || !(Math.abs(before) > 0) ? null : ((now - before) / before) * 100;
+
+const fmtNum = (v, d = 1) =>
+  v == null || isNaN(v) ? "—" : Number(v).toLocaleString("sv-SE", { maximumFractionDigits: d });
+
+const fmtPct = (v) => (v == null ? null : `${v > 0 ? "+" : ""}${fmtNum(v, 0)} %`);
+
+// Avkylning (ΔT) i grader ur Q/W. Energi (kWh) = m³ × 1,163 × ΔT, alltså
+// ΔT = 860 / (m³/MWh). Q/W 18 ≈ 48 °C, Q/W 24 ≈ 36 °C.
+//
+// OBS riktningen: Q/W är m³ per levererad MWh. Mer vatten per MWh betyder att
+// fjärrvärmevattnet kyls av sämre — LÄGRE Q/W är alltså bättre. Avkylning i
+// grader är mer intuitivt att visa för en styrelse, och gör tecknet
+// självförklarande.
+const dT = (qw) => (qw > 0 ? 860 / qw : null);
+
+// Avvikelsekontroll för den senaste månaden med fjärrvärmedata — den "interna
+// övervakningen": tyst när allt är normalt, tydlig flagga när något sticker ut.
+function dhDeviations(state, allReports, org) {
+  const withDh = allReports
+    .filter((r) => r.orgId === org.id && dhEffective(allReports, r) != null)
+    .sort((a, b) => (a.month < b.month ? 1 : -1));
+  const latest = withDh[0];
+  if (!latest) return { month: null, warnings: [], infos: [] };
+  const now = dhKpis(state, allReports, org, latest);
+  const prevReport = reportPrevYear(allReports, latest);
+  const prev = prevReport ? dhKpis(state, allReports, org, prevReport) : null;
+  const warnings = [];
+  const infos = [];
+  const dEnergi = pctDiff(now.korr ?? now.mwh, prev ? prev.korr ?? prev.mwh : null);
+  if (dEnergi != null && dEnergi > 10) {
+    warnings.push(
+      `Fjärrvärmen är ${fmtNum(dEnergi, 0)} % högre än samma månad föregående år${now.korr != null ? " (normalårskorrigerat)" : ""} — kontroll rekommenderas.`
+    );
+  }
+  // Q/W = m³/MWh. STIGANDE Q/W = mer fjärrvärmevatten per levererad MWh
+  // = sämre avkylning. Sjunkande Q/W är alltså en förbättring.
+  const dQw = pctDiff(now.qw, prev?.qw);
+  if (dQw != null && dQw > 10) {
+    warnings.push(
+      `Q/W har stigit från ${fmtNum(prev.qw)} till ${fmtNum(now.qw)} (avkylning ${fmtNum(dT(prev.qw), 0)} → ${fmtNum(dT(now.qw), 0)} °C) — sämre avkylning. Kontrollera returtemperatur och värmekurva.`
+    );
+  }
+  if (dQw != null && dQw < -10) {
+    infos.push(
+      `Q/W har sjunkit från ${fmtNum(prev.qw)} till ${fmtNum(now.qw)} (avkylning ${fmtNum(dT(prev.qw), 0)} → ${fmtNum(dT(now.qw), 0)} °C) — bättre energiutnyttjande i värmesystemet.`
+    );
+  }
+  if (!now.klimat) {
+    infos.push("Graddagar saknas för månaden — normalårskorrigering kunde inte göras. Fyll i under Graddagar nedan.");
+  }
+  if (!(orgAtemp(state, org) > 0)) {
+    infos.push("Atemp saknas — kWh/m² kan inte räknas. Fyll i Atemp under Redigera förening.");
+  }
+  return { month: latest.month, warnings, infos };
+}
+
+// Automatisk orsaksanalys: tolkar KOMBINATIONEN av nyckeltal och föreslår
+// troliga orsaker till differenser mot föregående år — det en driftcontroller
+// hade resonerat sig fram till. Returnerar en lista textrader (tom när det
+// inte finns någon väsentlig differens att förklara).
+function dhCauseAnalysis(state, allReports, org, report) {
+  const now = dhKpis(state, allReports, org, report);
+  if (!now) return [];
+  const prevReport = reportPrevYear(allReports, report);
+  const prev = prevReport ? dhKpis(state, allReports, org, prevReport) : null;
+  if (!prev) return [];
+
+  const dFakt = pctDiff(now.mwh, prev.mwh);
+  const dKorr = pctDiff(now.korr, prev.korr);
+  const dEnergi = dKorr ?? dFakt; // korrigerat om möjligt, annars faktiskt
+  const dQw = pctDiff(now.qw, prev.qw);
+  const dFlow = pctDiff(now.m3, prev.m3);
+
+  const lines = [];
+
+  // 1. Ökning som i huvudsak förklaras av vädret (faktiskt upp, korrigerat normalt).
+  if (dFakt != null && dFakt > 10 && dKorr != null && dKorr <= 10) {
+    lines.push(
+      `Den faktiska förbrukningen är ${fmtNum(dFakt, 0)} % högre, men normalårskorrigerat endast ${fmtPct(dKorr)} — ökningen förklaras i huvudsak av kallare väder än normalt, inte av driften.`
+    );
+  }
+
+  // 2. Verklig ökning (korrigerat) — orsaken beror på hur Q/W samtidigt rört sig.
+  if (dEnergi != null && dEnergi > 10) {
+    if (dQw != null && dQw < -10) {
+      lines.push(
+        `Förbrukningen har ökat ${fmtNum(dEnergi, 0)} % samtidigt som Q/W försämrats (${fmtNum(prev.qw)} → ${fmtNum(now.qw)}). Trolig orsak: sämre avkylning i värmesystemet — t.ex. hög returtemperatur, felinställd värmekurva, ventiler som står öppna eller cirkulationsproblem i undercentralen.`
+      );
+    } else if (dQw != null && dQw >= -10) {
+      lines.push(
+        `Förbrukningen har ökat ${fmtNum(dEnergi, 0)} % trots att avkylningen (Q/W) är fortsatt normal. Trolig orsak: ökat värmebehov snarare än driftfel — t.ex. höjd inomhustemperatur, ökad varmvattenanvändning, ändrad ventilation/vädring eller byggåtgärder som påverkat klimatskalet.`
+      );
+    } else {
+      lines.push(
+        `Förbrukningen har ökat ${fmtNum(dEnergi, 0)} %. Q/W-data saknas för jämförelsen — fyll i m³ för båda åren för att kunna skilja driftorsaker från ökat värmebehov.`
+      );
+    }
+  }
+
+  // 3. Verklig minskning — bekräfta om den beror på bättre drift.
+  if (dEnergi != null && dEnergi < -10) {
+    if (dQw != null && dQw > 0) {
+      lines.push(
+        `Förbrukningen har minskat ${fmtNum(Math.abs(dEnergi), 0)} % och Q/W har samtidigt förbättrats (${fmtNum(prev.qw)} → ${fmtNum(now.qw)}) — minskningen förefaller bero på bättre energiutnyttjande i värmesystemet, t.ex. injustering eller optimerad värmekurva.`
+      );
+    } else if (dQw != null && dQw < -10) {
+      lines.push(
+        `Förbrukningen har minskat ${fmtNum(Math.abs(dEnergi), 0)} % men Q/W har försämrats — kontrollera att mätvärdena stämmer och att undercentralen fungerar som avsett (minskning i kombination med sämre avkylning är ovanligt).`
+      );
+    }
+  }
+
+  // 4. Flödet sticker iväg utan motsvarande energiökning — klassiskt returtemperatur-tecken.
+  if (dFlow != null && dFlow > 15 && (dFakt == null || dFakt < 5)) {
+    lines.push(
+      `Flödet (m³) har ökat ${fmtNum(dFlow, 0)} % utan motsvarande energiökning — tyder på försämrad avkylning: kontrollera returtemperatur och att styrventiler stänger som de ska.`
+    );
+  }
+
+  // 6. Väderjustering saknas — flagga att vädret inte kunnat uteslutas som orsak.
+  if (lines.length > 0 && now.korr == null) {
+    lines.push(
+      "Observera: graddagar saknas för perioden, så väderpåverkan har inte kunnat räknas bort ur jämförelsen."
+    );
+  }
+
+  return lines;
+}
 
 /* ------------------------------ storage (Supabase) ------------------------------ */
 
@@ -666,7 +1218,7 @@ function AuthenticatedApp({ session }) {
   const actorName = session.user.email;
   const [tab, setTab] = useState("oversikt");
   const [toast, setToast] = useState(null);
-  const [propertyModal, setPropertyModal] = useState(null); // null | "add" | { editId }
+  const [orgModal, setOrgModal] = useState(null); // null | "list" | "add" | { editId }
 
   useEffect(() => {
     if (toast) {
@@ -679,9 +1231,16 @@ function AuthenticatedApp({ session }) {
 
   // Om den valda föreningen tas bort, gå tillbaka till "Alla" — men rör
   // aldrig "Alla" i sig, det är alltid ett giltigt läge.
+  //
+  // OBS: värdet är "org:<id>" och ska jämföras mot FÖRENINGARNA. Jämförs det
+  // mot fastigheternas id hittas aldrig någon matchning, och väljaren slår
+  // tillbaka till "Alla" så fort man väljer något.
   useEffect(() => {
     if (!state || propertyId === "all") return;
-    const stillExists = state.properties.some((p) => p.id === propertyId);
+    const orgId = propertyId.startsWith("org:") ? propertyId.slice(4) : null;
+    const stillExists = orgId
+      ? (state.organizations || []).some((o) => o.id === orgId)
+      : state.properties.some((p) => p.id === propertyId);
     if (!stillExists) {
       setPropertyId("all");
     }
@@ -700,44 +1259,99 @@ function AuthenticatedApp({ session }) {
   }
 
   const properties = state.properties;
-  const scopedProps = propertyId === "all" ? properties : properties.filter((p) => p.id === propertyId);
-  const selectedProperty = propertyId === "all" ? null : scopedProps[0] || null;
+  const organizations = state.organizations || [];
+
+  // propertyId kan ha två former:
+  //   "all"          — samtliga föreningar
+  //   "org:<id>"     — en förening
+  // Varje förening har en intern post som bär uppgifter, ärenden och
+  // debitering. Den skapas och underhålls automatiskt och syns aldrig i UI:t.
+  const orgScopeId = propertyId.startsWith("org:") ? propertyId.slice(4) : null;
+  const scopedProps =
+    propertyId === "all"
+      ? properties
+      : orgScopeId
+      ? properties.filter((p) => p.orgId === orgScopeId)
+      : properties.filter((p) => p.id === propertyId);
+
+  // Föreningens interna post, när en förening är vald.
+  const selectedProperty = propertyId === "all" || orgScopeId ? null : scopedProps[0] || null;
+  const selectedOrg = orgScopeId
+    ? organizations.find((o) => o.id === orgScopeId) || null
+    : selectedProperty
+    ? organizations.find((o) => o.id === selectedProperty.orgId) || null
+    : null;
   const billing = createBillingActions(state, setState, actorName, notify);
 
-  const savePropertyForm = (payload) => {
-    if (propertyModal && propertyModal !== "add") {
+  const saveOrganizationForm = (payload) => {
+    if (orgModal && orgModal !== "add" && orgModal !== "list") {
       setState({
         ...state,
+        organizations: organizations.map((o) =>
+          o.id === orgModal.editId ? { ...o, ...payload } : o
+        ),
+        // Fastigheten är en intern bärare av uppgifter, ärenden och debitering.
+        // Den speglar föreningens namn och adress så att listor och PDF:er
+        // fortsätter visa rätt sak utan att du behöver underhålla den.
         properties: state.properties.map((p) =>
-          p.id === propertyModal.editId ? { ...p, ...payload } : p
+          p.orgId === orgModal.editId
+            ? { ...p, name: payload.name, address: payload.address || p.address }
+            : p
         ),
       });
-      notify("Bostadsrättsförening uppdaterad");
+      notify("Förening uppdaterad");
     } else {
-      const newProp = { id: uid(), ...payload };
-      setState({ ...state, properties: [...state.properties, newProp] });
-      setPropertyId(newProp.id);
-      notify("Bostadsrättsförening tillagd");
+      // Föreningen får direkt en fastighet med samma namn och adress. De flesta
+      // föreningar har ett hus, och då ska byggnadsnivån vara osynlig. Har den
+      // flera lägger man till dem efteråt under Fastigheter.
+      const newOrg = { id: uid(), ...payload };
+      const forstaFastighet = {
+        id: uid(),
+        orgId: newOrg.id,
+        name: payload.name,
+        address: payload.address || "",
+        notes: "",
+        contacts: [],
+        rates: { FA: 0, TEK: 0, BIL: 0 },
+        atemp: 0,
+        boa: 0,
+        loa: 0,
+        biytor: 0,
+        atempMode: "manual",
+      };
+      setState({
+        ...state,
+        organizations: [...organizations, newOrg],
+        properties: [...state.properties, forstaFastighet],
+      });
+      setPropertyId(`org:${newOrg.id}`);
+      notify("Förening tillagd");
     }
-    setPropertyModal(null);
+    // I tomt läge finns ingen modal öppen — då ska vi inte öppna en.
+    setOrgModal(null);
   };
 
-  const removeProperty = (id) => {
-    const orphanOrderIds = new Set(
-      (state.billableOrders || []).filter((o) => o.propertyId === id).map((o) => o.id)
+  const removeOrganization = (id) => {
+    const propIds = new Set(properties.filter((p) => p.orgId === id).map((p) => p.id));
+    const orderIds = new Set(
+      (state.billableOrders || []).filter((o) => propIds.has(o.propertyId)).map((o) => o.id)
     );
     setState({
       ...state,
-      properties: state.properties.filter((p) => p.id !== id),
-      tasks: state.tasks.filter((t) => t.propertyId !== id),
-      checklistTemplates: state.checklistTemplates.filter((c) => c.propertyId !== id),
-      checklistRuns: state.checklistRuns.filter((r) => r.propertyId !== id),
-      issues: state.issues.filter((i) => i.propertyId !== id),
-      billableOrders: (state.billableOrders || []).filter((o) => o.propertyId !== id),
-      billableTimeEntries: (state.billableTimeEntries || []).filter((e) => !orphanOrderIds.has(e.orderId)),
-      invoiceBasis: (state.invoiceBasis || []).filter((b) => b.propertyId !== id),
+      organizations: organizations.filter((o) => o.id !== id),
+      properties: state.properties.filter((p) => p.orgId !== id),
+      tasks: state.tasks.filter((t) => !propIds.has(t.propertyId)),
+      checklistTemplates: state.checklistTemplates.filter((c) => !propIds.has(c.propertyId)),
+      checklistRuns: state.checklistRuns.filter((r) => !propIds.has(r.propertyId)),
+      issues: state.issues.filter((i) => !propIds.has(i.propertyId)),
+      billableOrders: (state.billableOrders || []).filter((o) => !propIds.has(o.propertyId)),
+      billableTimeEntries: (state.billableTimeEntries || []).filter((e) => !orderIds.has(e.orderId)),
+      invoiceBasis: (state.invoiceBasis || []).filter((b) => !propIds.has(b.propertyId)),
+      utilityReports: (state.utilityReports || []).filter((r) => r.orgId !== id),
+      rapportlogg: (state.rapportlogg || []).filter((r) => r.orgId !== id),
     });
-    notify("Bostadsrättsförening borttagen");
+    if (propertyId === `org:${id}`) setPropertyId("all");
+    notify("Förening raderad");
   };
 
   const tabs = [
@@ -748,14 +1362,11 @@ function AuthenticatedApp({ session }) {
     { id: "felanmalan", label: "Felanmälan" },
     { id: "tillaggstjanst", label: "Tilläggstjänster" },
     { id: "debitering", label: "Debitering" },
+    { id: "driftrapporter", label: "Driftrapporter" },
     { id: "kalender", label: "Kalender" },
     { id: "backup", label: "Backup" },
   ];
 
-  const editingProperty =
-    propertyModal && propertyModal !== "add"
-      ? properties.find((p) => p.id === propertyModal.editId)
-      : null;
 
   return (
     <div style={S.app}>
@@ -782,9 +1393,10 @@ function AuthenticatedApp({ session }) {
 
       <Header
         properties={properties}
+        organizations={organizations}
         propertyId={propertyId}
         setPropertyId={setPropertyId}
-        onAddNew={() => setPropertyModal("add")}
+        onAddNew={() => setOrgModal("add")}
         userEmail={actorName}
         onLogout={() => supabase.auth.signOut()}
         saving={saving}
@@ -798,10 +1410,11 @@ function AuthenticatedApp({ session }) {
               Välkommen! Lägg till er första bostadsrättsförening
             </div>
             <div style={{ ...S.rowSub, marginBottom: 16 }}>
-              Allt i appen — uppgifter, checklistor, ärenden och debitering — organiseras per
-              förening. Börja med att lägga till en.
+              Allt i appen utgår från föreningen. Fyll i föreningskortet så skapas dess
+              fastighet automatiskt — har föreningen flera hus lägger du till dem efteråt
+              under Fastigheter.
             </div>
-            <PropertyForm onSubmit={savePropertyForm} onCancel={null} />
+            <OrganizationForm onSubmit={saveOrganizationForm} onCancel={null} />
           </div>
         </main>
       ) : (
@@ -825,9 +1438,10 @@ function AuthenticatedApp({ session }) {
                 state={state}
                 scopedProps={scopedProps}
                 selectedProperty={selectedProperty}
+                selectedOrg={selectedOrg}
                 setTab={setTab}
-                onEditProperty={() => setPropertyModal({ editId: selectedProperty.id })}
-                onRemoveProperty={removeProperty}
+                onEditOrg={() => setOrgModal({ editId: selectedOrg.id })}
+                onRemoveOrg={removeOrganization}
               />
             )}
             {tab === "uppgifter" && (
@@ -893,6 +1507,16 @@ function AuthenticatedApp({ session }) {
                 notify={notify}
               />
             )}
+            {tab === "driftrapporter" && (
+              <Driftrapporter
+                state={state}
+                setState={setState}
+                scopedProps={scopedProps}
+                selectedOrg={selectedOrg}
+                actor={actorName}
+                notify={notify}
+              />
+            )}
             {tab === "kalender" && <Kalender state={state} scopedProps={scopedProps} />}
             {tab === "backup" && (
               <Backup state={state} setState={setState} notify={notify} lastSavedAt={lastSavedAt} />
@@ -901,15 +1525,15 @@ function AuthenticatedApp({ session }) {
         </>
       )}
 
-      {propertyModal && properties.length > 0 && (
-        <Modal onClose={() => setPropertyModal(null)}>
+      {orgModal && (
+        <Modal onClose={() => setOrgModal(null)}>
           <div style={S.taskCardTitle}>
-            {propertyModal === "add" ? "Ny bostadsrättsförening" : "Redigera förening"}
+            {orgModal === "add" ? "Ny förening" : "Redigera förening"}
           </div>
-          <PropertyForm
-            initial={editingProperty}
-            onSubmit={savePropertyForm}
-            onCancel={() => setPropertyModal(null)}
+          <OrganizationForm
+            initial={orgModal === "add" ? null : organizations.find((o) => o.id === orgModal.editId)}
+            onSubmit={saveOrganizationForm}
+            onCancel={() => setOrgModal(null)}
           />
         </Modal>
       )}
@@ -940,7 +1564,7 @@ function Modal({ children, onClose }) {
 
 /* ------------------------------ header ------------------------------ */
 
-function Header({ properties, propertyId, setPropertyId, onAddNew, userEmail, onLogout, saving, lastSavedAt }) {
+function Header({ properties, organizations, propertyId, setPropertyId, onAddNew, userEmail, onLogout, saving, lastSavedAt }) {
   const savedLabel = saving
     ? "sparar…"
     : lastSavedAt
@@ -960,10 +1584,10 @@ function Header({ properties, propertyId, setPropertyId, onAddNew, userEmail, on
             onChange={(e) => setPropertyId(e.target.value)}
             style={S.selectHeader}
           >
-            <option value="all">Alla bostadsrättsföreningar</option>
-            {properties.map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.name}
+            <option value="all">Alla föreningar</option>
+            {(organizations || []).map((org) => (
+              <option key={org.id} value={`org:${org.id}`}>
+                {org.name}
               </option>
             ))}
           </select>
@@ -977,6 +1601,7 @@ function Header({ properties, propertyId, setPropertyId, onAddNew, userEmail, on
         >
           + Förening
         </button>
+
         <div style={S.userBadge} title={userEmail}>
           {userEmail}
         </div>
@@ -988,40 +1613,73 @@ function Header({ properties, propertyId, setPropertyId, onAddNew, userEmail, on
   );
 }
 
-/* ------------------------------ bostadsrättsförening ------------------------------ */
+/* ------------------------------ förening (avtalspart) ------------------------------ */
 
-function PropertyForm({ initial, onSubmit, onCancel }) {
+// Föreningen är avtalsparten: styrelse, rapportmottagare, timpriser och
+// avtalsnivå. Den lagrar ingen mätdata — den ligger på fastigheterna och
+// summeras upp hit.
+function OrganizationForm({ initial, onSubmit, onCancel }) {
   const [name, setName] = useState(initial?.name || "");
-  const [address, setAddress] = useState(initial?.address || "");
-  const [notes, setNotes] = useState(initial?.notes || "");
+  const [orgnr, setOrgnr] = useState(initial?.orgnr || "");
+  const [email, setEmail] = useState(initial?.email || "");
+  const [kontaktperson, setKontaktperson] = useState(initial?.kontaktperson || "");
+  const [avtalsniva, setAvtalsniva] = useState(initial?.avtalsniva || "Standard");
   const [faRate, setFaRate] = useState(initial?.rates?.FA ?? "");
   const [tekRate, setTekRate] = useState(initial?.rates?.TEK ?? "");
   const [bilRate, setBilRate] = useState(initial?.rates?.BIL ?? "");
+  const [notes, setNotes] = useState(initial?.notes || "");
+  const [vvAuto, setVvAuto] = useState(initial ? initial.vvAuto !== false : true);
+  const [vvBastal, setVvBastal] = useState(initial?.vvBastal || "");
+  // Byggnadsdata (referens för nyckeltal). Atemp kan anges direkt eller räknas
+  // ut från BOA + LOA (Atemp ≈ 1,25 × (BOA + LOA) för flerbostadshus).
+  const [atempMode, setAtempMode] = useState(initial?.atempMode === "beraknad" ? "beraknad" : "manual");
+  const [atemp, setAtemp] = useState(initial?.atemp || "");
+  const [boa, setBoa] = useState(initial?.boa || "");
+  const [loa, setLoa] = useState(initial?.loa || "");
+  const [antalLgh, setAntalLgh] = useState(initial?.antalLgh || "");
+  const [antalBoende, setAntalBoende] = useState(initial?.antalBoende || "");
+  const beraknadAtemp = Math.round(1.25 * ((Number(boa) || 0) + (Number(loa) || 0)));
+  // Föreningens adresser. En rad per hus — det är hela behovet av "flera hus".
+  const [addresses, setAddresses] = useState(
+    initial?.addresses?.length ? initial.addresses : [{ id: uid(), text: initial?.address || "" }]
+  );
+  const updateAddress = (id, value) =>
+    setAddresses((as) => as.map((a) => (a.id === id ? { ...a, text: value } : a)));
+  const addAddressRow = () => setAddresses((as) => [...as, { id: uid(), text: "" }]);
+  const removeAddressRow = (id) => setAddresses((as) => as.filter((a) => a.id !== id));
   const [contacts, setContacts] = useState(
-    initial?.contacts?.length ? initial.contacts : [{ id: uid(), role: CONTACT_ROLES[0], name: "", phone: "", email: "" }]
+    initial?.contacts?.length
+      ? initial.contacts
+      : [{ id: uid(), role: CONTACT_ROLES[0], name: "", phone: "", email: "" }]
   );
 
-  const updateContact = (id, field, value) => {
+  const updateContact = (id, field, value) =>
     setContacts((cs) => cs.map((c) => (c.id === id ? { ...c, [field]: value } : c)));
-  };
-
-  const addContactRow = () => {
+  const addContactRow = () =>
     setContacts((cs) => [...cs, { id: uid(), role: CONTACT_ROLES[0], name: "", phone: "", email: "" }]);
-  };
-
-  const removeContactRow = (id) => {
-    setContacts((cs) => cs.filter((c) => c.id !== id));
-  };
+  const removeContactRow = (id) => setContacts((cs) => cs.filter((c) => c.id !== id));
 
   const submit = (e) => {
     e.preventDefault();
     if (!name.trim()) return;
-    const cleanContacts = contacts.filter((c) => c.name.trim() || c.phone.trim() || c.email.trim());
     onSubmit({
       name: name.trim(),
-      address: address.trim(),
+      orgnr: orgnr.trim(),
+      addresses: addresses.filter((a) => a.text.trim()).map((a) => ({ ...a, text: a.text.trim() })),
+      address: (addresses.find((a) => a.text.trim())?.text || "").trim(),
+      email: email.trim(),
+      kontaktperson: kontaktperson.trim(),
+      avtalsniva,
+      vvAuto,
+      vvBastal: Number(vvBastal) || 0,
+      atempMode,
+      atemp: atempMode === "beraknad" ? beraknadAtemp : Number(atemp) || 0,
+      boa: Number(boa) || 0,
+      loa: Number(loa) || 0,
+      antalLgh: Number(antalLgh) || 0,
+      antalBoende: Number(antalBoende) || 0,
       notes: notes.trim(),
-      contacts: cleanContacts,
+      contacts: contacts.filter((c) => c.name.trim() || c.phone.trim() || c.email.trim()),
       rates: { FA: Number(faRate) || 0, TEK: Number(tekRate) || 0, BIL: Number(bilRate) || 0 },
     });
   };
@@ -1031,63 +1689,97 @@ function PropertyForm({ initial, onSubmit, onCancel }) {
       <div style={S.formRow}>
         <label style={S.label}>
           Föreningens namn
-          <input className="fk-input" style={S.input} value={name} onChange={(e) => setName(e.target.value)} placeholder="t.ex. BRF Kvarngatan 4" required />
+          <input className="fk-input" style={S.input} value={name} onChange={(e) => setName(e.target.value)} placeholder="t.ex. BRF Solrosen" required />
         </label>
         <label style={S.label}>
-          Adress
-          <input className="fk-input" style={S.input} value={address} onChange={(e) => setAddress(e.target.value)} placeholder="Gatuadress, postnr, ort" />
+          Organisationsnummer
+          <input className="fk-input" style={S.input} value={orgnr} onChange={(e) => setOrgnr(e.target.value)} placeholder="000000-0000" />
+        </label>
+        <label style={S.label}>
+          Kontaktperson
+          <input className="fk-input" style={S.input} value={kontaktperson} onChange={(e) => setKontaktperson(e.target.value)} placeholder="Ordförande eller motsvarande" />
         </label>
       </div>
 
-      <div>
-        <div style={{ ...S.label, marginBottom: 8 }}>
-          Prissättning — kopplas till Felanmälan/Tilläggstjänster och används för nyckeltalen i Debitering
+      <div style={{ border: "1px solid #C9C4B7", borderRadius: 8, padding: "12px 14px" }}>
+        <div style={{ ...S.label, marginBottom: 8 }}>Adresser</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {addresses.map((a) => (
+            <div key={a.id} style={S.contactFormRow}>
+              <input
+                className="fk-input"
+                style={{ ...S.input, flex: 1 }}
+                value={a.text}
+                onChange={(e) => updateAddress(a.id, e.target.value)}
+                placeholder="Gatuadress, postnr, ort"
+              />
+              {addresses.length > 1 && (
+                <button type="button" onClick={() => removeAddressRow(a.id)} style={S.miniDelete} aria-label="Ta bort adress">×</button>
+              )}
+            </div>
+          ))}
+        </div>
+        <button type="button" onClick={addAddressRow} style={S.linkBtn}>+ Lägg till adress</button>
+        <div style={S.hint}>Har föreningen flera hus lägger du till en rad per adress.</div>
+      </div>
+
+      <div style={{ border: "1px solid #C9C4B7", borderRadius: 8, padding: "12px 14px" }}>
+        <div style={{ ...S.label, marginBottom: 8 }}>Rapportering till styrelsen</div>
+        <div style={{ ...S.rowSub, marginBottom: 10 }}>
+          Vart driftrapporten går och hur ofta den ska lämnas. Avvikelser som upptäcks
+          däremellan syns för dig i Driftrapporter — styrelsen behöver inte få dem varje månad.
         </div>
         <div style={S.formRow}>
           <label style={S.label}>
-            FA — kr/h
-            <input
-              className="fk-input"
-              style={S.input}
-              type="number"
-              min="0"
-              value={faRate}
-              onChange={(e) => setFaRate(e.target.value)}
-              placeholder="t.ex. 650"
-            />
+            E-post till styrelsen
+            <input className="fk-input" style={S.input} type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="styrelsen@brfsolrosen.se" />
+            <span style={S.hint}>Driftrapporten skickas hit.</span>
           </label>
           <label style={S.label}>
-            TEK — kr/h
-            <input
-              className="fk-input"
-              style={S.input}
-              type="number"
-              min="0"
-              value={tekRate}
-              onChange={(e) => setTekRate(e.target.value)}
-              placeholder="t.ex. 850"
-            />
+            Avtalsnivå
+            <select className="fk-input" style={S.input} value={avtalsniva} onChange={(e) => setAvtalsniva(e.target.value)}>
+              {AVTALSNIVAER.map((a) => (
+                <option key={a} value={a}>{a}</option>
+              ))}
+            </select>
+            <span style={S.hint}>
+              Standard = kvartalsrapport. Plus = månadsvis driftstatus.
+            </span>
           </label>
-        </div>
-        <div style={{ ...S.formRow, marginTop: 10 }}>
-          <label style={S.label}>
-            BIL — kr/styck
-            <input
-              className="fk-input"
-              style={S.input}
-              type="number"
-              min="0"
-              value={bilRate}
-              onChange={(e) => setBilRate(e.target.value)}
-              placeholder="t.ex. 50"
-            />
-          </label>
-          <div />
         </div>
       </div>
 
-      <div>
-        <div style={{ ...S.label, marginBottom: 8 }}>Kontaktuppgifter (styrelse, förvaltare m.fl.)</div>
+      <div style={{ border: "1px solid #C9C4B7", borderRadius: 8, padding: "12px 14px" }}>
+        <div style={{ ...S.label, marginBottom: 8 }}>Timpriser och ersättning</div>
+        <div style={{ ...S.rowSub, marginBottom: 10 }}>
+          Priserna hämtas härifrån när du prissätter tilläggstjänster och felanmälningar
+          i Debitering. Ändrar du dem gäller de framåt — redan skapade underlag räknas inte om.
+        </div>
+        <div style={S.formRow}>
+          <label style={S.label}>
+            Timpris FA (kr/h)
+            <input className="fk-input" style={S.input} inputMode="numeric" value={faRate} onChange={(e) => setFaRate(e.target.value)} placeholder="0" />
+            <span style={S.hint}>Fastighetsarbete</span>
+          </label>
+          <label style={S.label}>
+            Timpris TEK (kr/h)
+            <input className="fk-input" style={S.input} inputMode="numeric" value={tekRate} onChange={(e) => setTekRate(e.target.value)} placeholder="0" />
+            <span style={S.hint}>Tekniskt arbete</span>
+          </label>
+          <label style={S.label}>
+            Bilersättning (kr/st)
+            <input className="fk-input" style={S.input} inputMode="numeric" value={bilRate} onChange={(e) => setBilRate(e.target.value)} placeholder="0" />
+            <span style={S.hint}>Per utryckning</span>
+          </label>
+        </div>
+      </div>
+
+      <div style={{ border: "1px solid #C9C4B7", borderRadius: 8, padding: "12px 14px" }}>
+        <div style={{ ...S.label, marginBottom: 8 }}>Styrelse och övriga kontakter</div>
+        <div style={{ ...S.rowSub, marginBottom: 10 }}>
+          Personerna du ringer när något behöver beslutas eller släppas in. Adressen
+          högst upp är den som driftrapporten skickas till — de här är för kontakt.
+        </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {contacts.map((c) => (
             <div key={c.id} style={S.contactFormRow}>
@@ -1101,27 +1793,9 @@ function PropertyForm({ initial, onSubmit, onCancel }) {
                   <option key={r} value={r}>{r}</option>
                 ))}
               </select>
-              <input
-                className="fk-input"
-                style={{ ...S.input, flex: 1 }}
-                placeholder="Namn"
-                value={c.name}
-                onChange={(e) => updateContact(c.id, "name", e.target.value)}
-              />
-              <input
-                className="fk-input"
-                style={{ ...S.input, flex: 1 }}
-                placeholder="Telefon"
-                value={c.phone}
-                onChange={(e) => updateContact(c.id, "phone", e.target.value)}
-              />
-              <input
-                className="fk-input"
-                style={{ ...S.input, flex: 1 }}
-                placeholder="E-post"
-                value={c.email}
-                onChange={(e) => updateContact(c.id, "email", e.target.value)}
-              />
+              <input className="fk-input" style={{ ...S.input, flex: 1 }} placeholder="Namn" value={c.name} onChange={(e) => updateContact(c.id, "name", e.target.value)} />
+              <input className="fk-input" style={{ ...S.input, flex: 1 }} placeholder="Telefon" value={c.phone} onChange={(e) => updateContact(c.id, "phone", e.target.value)} />
+              <input className="fk-input" style={{ ...S.input, flex: 1 }} placeholder="E-post" value={c.email} onChange={(e) => updateContact(c.id, "email", e.target.value)} />
               <button type="button" onClick={() => removeContactRow(c.id)} style={S.miniDelete} aria-label="Ta bort kontakt">×</button>
             </div>
           ))}
@@ -1129,14 +1803,103 @@ function PropertyForm({ initial, onSubmit, onCancel }) {
         <button type="button" onClick={addContactRow} style={S.linkBtn}>+ Lägg till kontakt</button>
       </div>
 
+      {/* Byggnadsdata: referensvärden som sällan ändras och används som nämnare
+          i nyckeltalen (kWh/m², m³/m², liter per person och dygn). */}
+      <div style={{ border: "1px solid #C9C4B7", borderRadius: 8, padding: "12px 14px" }}>
+        <div style={{ ...S.label, marginBottom: 8 }}>Byggnadsdata (för nyckeltal)</div>
+        <div style={{ ...S.rowSub, marginBottom: 10 }}>
+          Referensvärden som sällan ändras. De används som nämnare i nyckeltalen: kWh/m² och m³/m²
+          mot Atemp, och liter per person och dygn mot antal boende.
+        </div>
+        <div style={S.formRow}>
+          <label style={S.label}>
+            BOA — boarea (m²)
+            <input className="fk-input" style={S.input} type="number" step="1" min="0" value={boa} onChange={(e) => setBoa(e.target.value)} />
+          </label>
+          <label style={S.label}>
+            LOA — lokalarea (m²)
+            <input className="fk-input" style={S.input} type="number" step="1" min="0" value={loa} onChange={(e) => setLoa(e.target.value)} />
+          </label>
+        </div>
+        <label style={{ ...S.rowSub, display: "flex", alignItems: "center", gap: 8, cursor: "pointer", marginTop: 4 }}>
+          <input type="checkbox" checked={atempMode === "beraknad"} onChange={(e) => setAtempMode(e.target.checked ? "beraknad" : "manual")} />
+          Räkna ut Atemp automatiskt från BOA + LOA (≈ 1,25 × (BOA + LOA))
+        </label>
+        <div style={S.formRow}>
+          <label style={{ ...S.label, opacity: atempMode === "beraknad" ? 0.45 : 1 }}>
+            Atemp — manuellt (m²)
+            <input
+              className="fk-input"
+              style={{ ...S.input, ...(atempMode === "beraknad" ? { background: "#EFEDE6", color: "#A8A395" } : {}) }}
+              type="number"
+              step="1"
+              min="0"
+              value={atemp}
+              onChange={(e) => setAtemp(e.target.value)}
+              readOnly={atempMode === "beraknad"}
+              placeholder={atempMode === "beraknad" ? "" : "skriv in direkt"}
+            />
+          </label>
+          <label style={{ ...S.label, opacity: atempMode === "manual" ? 0.45 : 1 }}>
+            Atemp — beräknat (m²)
+            <input
+              className="fk-input"
+              style={{ ...S.input, ...(atempMode === "manual" ? { background: "#EFEDE6", color: "#A8A395" } : {}) }}
+              value={beraknadAtemp || ""}
+              readOnly
+              placeholder="räknas från BOA + LOA"
+            />
+          </label>
+        </div>
+        <div style={S.formRow}>
+          <label style={S.label}>
+            Antal lägenheter
+            <input className="fk-input" style={S.input} type="number" step="1" min="0" value={antalLgh} onChange={(e) => setAntalLgh(e.target.value)} />
+          </label>
+          <label style={S.label}>
+            Antal boende
+            <input className="fk-input" style={S.input} type="number" step="1" min="0" value={antalBoende} onChange={(e) => setAntalBoende(e.target.value)} placeholder="för liter/person/dygn" />
+          </label>
+        </div>
+      </div>
+
+      {/* Varmvattnet är väderoberoende och ska INTE graddagskorrigeras. Eftersom
+          det finns en avläsning per förening bestäms bastalet här, en gång. */}
+      <div style={{ border: "1px solid #C9C4B7", borderRadius: 8, padding: "12px 14px" }}>
+        <div style={{ ...S.label, marginBottom: 8 }}>Varmvatten</div>
+        <div style={{ ...S.rowSub, marginBottom: 10 }}>
+          Appen korrigerar bara uppvärmningsdelen mot graddagarna: korrigerad energi =
+          varmvatten + (total − varmvatten) × (normalår / faktiska graddagar).
+        </div>
+        <label style={{ ...S.rowSub, display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+          <input type="checkbox" checked={vvAuto} onChange={(e) => setVvAuto(e.target.checked)} />
+          Skatta varmvattnet automatiskt från sommarmånaderna (juni–augusti)
+        </label>
+        <div style={S.formRow}>
+          <label style={S.label}>
+            {vvAuto ? "Bastal som reserv (MWh/månad, valfritt)" : "Bastal varmvatten (MWh/månad)"}
+            <input
+              className="fk-input"
+              style={S.input}
+              type="number"
+              step="0.1"
+              min="0"
+              value={vvBastal}
+              onChange={(e) => setVvBastal(e.target.value)}
+              placeholder="t.ex. 9 — ungefär sommarmånadernas MWh"
+            />
+          </label>
+        </div>
+      </div>
+
       <label style={S.label}>
-        Övriga anteckningar
+        Anteckningar
         <textarea
           className="fk-input"
           style={{ ...S.input, height: 80, resize: "vertical" }}
           value={notes}
           onChange={(e) => setNotes(e.target.value)}
-          placeholder="Portkoder, larmkoder, avtalsdetaljer m.m."
+          placeholder="Avtalsdetaljer, uppsägningstid, särskilda överenskommelser…"
         />
       </label>
 
@@ -1154,10 +1917,7 @@ function PropertyForm({ initial, onSubmit, onCancel }) {
   );
 }
 
-/* ------------------------------ översikt ------------------------------ */
-
-
-function Oversikt({ state, scopedProps, selectedProperty, setTab, onEditProperty, onRemoveProperty }) {
+function Oversikt({ state, scopedProps, selectedProperty, selectedOrg, setTab, onEditOrg, onRemoveOrg }) {
   const ids = new Set(scopedProps.map((p) => p.id));
   const tasks = state.tasks.filter((t) => ids.has(t.propertyId));
   const issues = state.issues.filter((i) => ids.has(i.propertyId));
@@ -1174,6 +1934,10 @@ function Oversikt({ state, scopedProps, selectedProperty, setTab, onEditProperty
   const propName = (id) => state.properties.find((p) => p.id === id)?.name || "";
 
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+  // Föreningens interna post — bär uppgifter, ärenden och felanmälningslänken.
+  const egenPost = selectedOrg
+    ? state.properties.find((p) => p.orgId === selectedOrg.id) || null
+    : null;
   const [notesExpanded, setNotesExpanded] = useState(false);
   const [linkCopied, setLinkCopied] = useState(false);
 
@@ -1187,25 +1951,81 @@ function Oversikt({ state, scopedProps, selectedProperty, setTab, onEditProperty
 
   return (
     <div style={{ animation: "fk-rise .25s ease" }}>
-      {selectedProperty && (
+      {selectedOrg && (
         <div style={{ ...S.checklistCard, marginBottom: 18 }}>
           <div style={S.checklistHead}>
             <div>
-              <div style={{ ...S.taskCardTitle, fontSize: 19 }}>{selectedProperty.name}</div>
-              <div style={S.taskCardProp}>{selectedProperty.address || "Ingen adress angiven"}</div>
-              <div style={{ ...S.rowSub, marginTop: 4 }}>
-                FA {selectedProperty.rates?.FA || 0} kr/h · TEK {selectedProperty.rates?.TEK || 0} kr/h · BIL {selectedProperty.rates?.BIL || 0} kr/st
+              <div style={{ ...S.taskCardTitle, fontSize: 19 }}>{selectedOrg.name}</div>
+              <div style={S.taskCardProp}>
+                {(selectedOrg.addresses || []).length > 0
+                  ? selectedOrg.addresses.map((a) => a.text).join(" · ")
+                  : "Ingen adress angiven"}
               </div>
+              <div style={{ ...S.rowSub, marginTop: 4 }}>
+                {selectedOrg.avtalsniva}
+                {selectedOrg.email ? ` · ${selectedOrg.email}` : " · e-post saknas"}
+              </div>
+              <div style={{ ...S.rowSub, marginTop: 4 }}>
+                FA {selectedOrg.rates?.FA || 0} kr/h · TEK {selectedOrg.rates?.TEK || 0} kr/h · BIL {selectedOrg.rates?.BIL || 0} kr/st
+              </div>
+              <div style={{ ...S.rowSub, marginTop: 4 }}>
+                {(() => {
+                  const parts = [];
+                  if (selectedOrg.atemp) parts.push(`Atemp ${selectedOrg.atemp.toLocaleString("sv-SE")} m²${selectedOrg.atempMode === "beraknad" ? " (beräknad)" : ""}`);
+                  if (selectedOrg.boa) parts.push(`BOA ${selectedOrg.boa.toLocaleString("sv-SE")} m²`);
+                  if (selectedOrg.loa) parts.push(`LOA ${selectedOrg.loa.toLocaleString("sv-SE")} m²`);
+                  if (selectedOrg.antalLgh) parts.push(`${selectedOrg.antalLgh} lgh`);
+                  if (selectedOrg.antalBoende) parts.push(`${selectedOrg.antalBoende} boende`);
+                  return parts.length ? (
+                    <>Byggnadsdata: {parts.join(" · ")}</>
+                  ) : (
+                    <>Byggnadsdata: <em>ej ifylld — fyll i under Redigera förening</em></>
+                  );
+                })()}
+              </div>
+              <div style={{ ...S.rowSub, marginTop: 4 }}>
+                {/* Graddagar och varmvattenbas hör till FÖRENINGEN — det finns en
+                    avläsning per förening, oavsett antal byggnader. */}
+                Graddagar: {selectedOrg?.useOwnKlimat ? "egen serie (annan leverantör)" : "gemensam serie"}
+                {" · "}Varmvatten: {(() => {
+                  const auto = selectedOrg?.vvAuto !== false;
+                  const sommar = (state.utilityReports || []).filter(
+                    (r) =>
+                      r.orgId === selectedOrg?.id &&
+                      ["06", "07", "08"].includes(r.month.slice(5, 7)) &&
+                      dhEffective(state.utilityReports || [], r) != null
+                  );
+                  const bas = varmvattenBas(state.utilityReports || [], selectedOrg);
+                  if (auto && sommar.length > 0)
+                    return `${bas.toLocaleString("sv-SE", { maximumFractionDigits: 1 })} MWh/mån (auto, snitt av ${sommar.length} sommarmånad${sommar.length > 1 ? "er" : ""})`;
+                  if (auto)
+                    return bas > 0
+                      ? `${bas.toLocaleString("sv-SE", { maximumFractionDigits: 1 })} MWh/mån (reservvärde — auto tar över vid första sommarmånaden)`
+                      : "inget bastal ännu — hela energin korrigeras tills sommardata eller reservvärde finns";
+                  return `${(selectedOrg?.vvBastal || 0).toLocaleString("sv-SE", { maximumFractionDigits: 1 })} MWh/mån (manuellt låst)`;
+                })()}
+              </div>
+              {(selectedOrg.contacts || []).length > 0 && (
+                <div style={{ ...S.rowSub, marginTop: 4 }}>
+                  {selectedOrg.contacts.map((c) => (
+                    <div key={c.id}>
+                      {c.role}: {c.name || "—"}
+                      {c.phone ? ` · ${c.phone}` : ""}
+                      {c.email ? ` · ${c.email}` : ""}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
             <div style={{ display: "flex", gap: 8 }}>
-              <button style={S.stampBtn} className="fk-btn" onClick={onEditProperty}>
-                Redigera
+              <button style={S.stampBtn} className="fk-btn" onClick={onEditOrg}>
+                Redigera förening
               </button>
               {confirmingDelete ? (
                 <button
                   style={{ ...S.stampBtn, background: "#C4171C" }}
                   className="fk-btn"
-                  onClick={() => onRemoveProperty(selectedProperty.id)}
+                  onClick={() => onRemoveOrg(selectedOrg.id)}
                 >
                   Bekräfta borttagning
                 </button>
@@ -1224,16 +2044,16 @@ function Oversikt({ state, scopedProps, selectedProperty, setTab, onEditProperty
                 type="button"
                 style={S.secondaryBtnSmall}
                 className="fk-btn"
-                onClick={() => copyFelanmalanLink(selectedProperty.id)}
+                onClick={() => copyFelanmalanLink(egenPost?.id)}
               >
                 {linkCopied ? "Kopierad!" : "Kopiera länk"}
               </button>
             </div>
           </div>
 
-          {(selectedProperty.contacts || []).length > 0 && (
+          {(selectedOrg.contacts || []).length > 0 && (
             <div style={S.runBox}>
-              {selectedProperty.contacts.map((c) => (
+              {selectedOrg.contacts.map((c) => (
                 <div key={c.id} style={S.contactRow}>
                   <span style={S.contactRole}>{c.role}</span>
                   <span style={S.contactName}>{c.name}</span>
@@ -1243,27 +2063,27 @@ function Oversikt({ state, scopedProps, selectedProperty, setTab, onEditProperty
             </div>
           )}
 
-          {selectedProperty.notes && (
+          {selectedOrg.notes && (
             <div style={S.historyRow}>
               <button onClick={() => setNotesExpanded((v) => !v)} style={S.linkBtn}>
                 {notesExpanded ? "Dölj anteckningar" : "Visa anteckningar"}
               </button>
               {notesExpanded && (
-                <div style={{ ...S.rowSub, marginTop: 6, whiteSpace: "pre-wrap" }}>{selectedProperty.notes}</div>
+                <div style={{ ...S.rowSub, marginTop: 6, whiteSpace: "pre-wrap" }}>{selectedOrg.notes}</div>
               )}
             </div>
           )}
         </div>
       )}
 
-      {!selectedProperty && (
+      {!selectedOrg && (
         <div style={{ ...S.panel, marginBottom: 18 }}>
-          <h2 style={{ ...S.h2, marginBottom: 4 }}>Alla bostadsrättsföreningar</h2>
+          <h2 style={{ ...S.h2, marginBottom: 4 }}>Alla fastigheter</h2>
           <div style={{ ...S.rowSub, marginBottom: 14 }}>
-            Sammanställning över samtliga {scopedProps.length} föreningar. Välj en specifik förening i listan högst upp för att se och redigera dess detaljer.
+            Sammanställning över samtliga {scopedProps.length} fastigheter. Välj en förening eller en enskild fastighet i listan högst upp för att se och redigera detaljerna.
           </div>
           {scopedProps.length === 0 ? (
-            <EmptyNote text="Inga bostadsrättsföreningar ännu." />
+            <EmptyNote text="Inga fastigheter ännu." />
           ) : (
             <div style={{ overflowX: "auto" }}>
               <table style={S.summaryTable}>
@@ -1501,7 +2321,7 @@ function PropertyPicker({ properties, value, onChange }) {
   if (properties.length <= 1) return null;
   return (
     <label style={S.label}>
-      Bostadsrättsförening
+      Fastighet
       <select className="fk-input" style={S.input} value={value} onChange={(e) => onChange(e.target.value)}>
         {properties.map((p) => (
           <option key={p.id} value={p.id}>{p.name}</option>
@@ -1574,12 +2394,20 @@ function Checklistor({ state, setState, scopedProps, actor, notify }) {
   const propName = (id) => state.properties.find((p) => p.id === id)?.name || "";
   const templates = state.checklistTemplates.filter((t) => ids.has(t.propertyId));
 
+  // Vilken periodruta som är öppen just nu: { templateId, period }.
+  const [active, setActive] = useState(null);
+
   const addTemplate = (payload) => {
     setState({
       ...state,
       checklistTemplates: [
         ...state.checklistTemplates,
-        { id: uid(), ...payload, items: payload.items.map((text) => ({ id: uid(), text })) },
+        {
+          id: uid(),
+          ...payload,
+          interval: payload.interval || "vecka",
+          items: payload.items.map((text) => ({ id: uid(), text })),
+        },
       ],
     });
     setShowForm(false);
@@ -1592,21 +2420,34 @@ function Checklistor({ state, setState, scopedProps, actor, notify }) {
       checklistRuns: state.checklistRuns.filter((r) => r.templateId !== id),
     });
 
-  const runsFor = (templateId) =>
-    state.checklistRuns
-      .filter((r) => r.templateId === templateId)
-      .sort((a, b) => (a.date < b.date ? 1 : -1));
+  // Körningen för en viss period. Äldre körningar utan period härleds från datumet.
+  const runFor = (templateId, period, interval) =>
+    state.checklistRuns.find(
+      (r) => r.templateId === templateId && (r.period || periodKey(r.date, interval)) === period
+    ) || null;
 
-  const startRun = (template) => {
-    const run = {
-      id: uid(),
-      templateId: template.id,
-      propertyId: template.propertyId,
-      date: todayISO(),
-      doneBy: actor || "Okänd",
-      checkedItemIds: [],
-    };
-    setState({ ...state, checklistRuns: [...state.checklistRuns, run] });
+  const lastDoneRun = (templateId, interval) =>
+    state.checklistRuns
+      .filter((r) => r.templateId === templateId && r.done)
+      .sort((a, b) => ((a.period || periodKey(a.date, interval)) < (b.period || periodKey(b.date, interval)) ? 1 : -1))[0] || null;
+
+  // Öppna en period för avprickning. Skapar en körning om det inte redan finns en.
+  const openPeriod = (template, period) => {
+    const interval = template.interval || "vecka";
+    if (!runFor(template.id, period, interval)) {
+      const run = {
+        id: uid(),
+        templateId: template.id,
+        propertyId: template.propertyId,
+        period,
+        date: todayISO(),
+        doneBy: actor || "Okänd",
+        checkedItemIds: [],
+        done: false,
+      };
+      setState({ ...state, checklistRuns: [...state.checklistRuns, run] });
+    }
+    setActive({ templateId: template.id, period });
   };
 
   const toggleItem = (run, itemId) => {
@@ -1619,8 +2460,24 @@ function Checklistor({ state, setState, scopedProps, actor, notify }) {
     });
   };
 
-  const finishRun = (run, total) => {
-    notify(`Rondering klar (${run.checkedItemIds.length}/${total} punkter)`);
+  // Bekräfta att ronderingen är gjord för perioden.
+  const confirmRun = (run) => {
+    setState({
+      ...state,
+      checklistRuns: state.checklistRuns.map((r) =>
+        r.id === run.id ? { ...r, done: true, date: todayISO(), doneBy: actor || "Okänd" } : r
+      ),
+    });
+    notify("Rondering bekräftad för perioden");
+    setActive(null);
+  };
+
+  // Ångra en bekräftad period (t.ex. felklick) — körningen finns kvar men markeras ej klar.
+  const reopenRun = (run) => {
+    setState({
+      ...state,
+      checklistRuns: state.checklistRuns.map((r) => (r.id === run.id ? { ...r, done: false } : r)),
+    });
   };
 
   return (
@@ -1639,8 +2496,13 @@ function Checklistor({ state, setState, scopedProps, actor, notify }) {
       ) : (
         <div style={S.checklistStack}>
           {templates.map((tmpl) => {
-            const runs = runsFor(tmpl.id);
-            const activeRun = runs.find((r) => r.date === todayISO()) || null;
+            const interval = tmpl.interval || "vecka";
+            const periods = recentPeriods(interval, periodCount(interval));
+            const currentKey = periodKey(new Date(), interval);
+            const last = lastDoneRun(tmpl.id, interval);
+            const intervalLabel = interval === "vecka" ? "Varje vecka" : interval === "månad" ? "Varje månad" : "Varje år";
+            const activeRun =
+              active && active.templateId === tmpl.id ? runFor(tmpl.id, active.period, interval) : null;
             return (
               <div key={tmpl.id} style={S.checklistCard}>
                 <div style={S.checklistHead}>
@@ -1649,20 +2511,58 @@ function Checklistor({ state, setState, scopedProps, actor, notify }) {
                       {tmpl.title}
                       {showPropertyTag && <span style={S.propertyTag}>{propName(tmpl.propertyId)}</span>}
                     </div>
-                    <div style={S.taskCardProp}>{tmpl.items.length} punkter</div>
+                    <div style={S.taskCardProp}>{tmpl.items.length} punkter · {intervalLabel}</div>
                   </div>
-                  <div style={{ display: "flex", gap: 8 }}>
-                    {!activeRun && (
-                      <button style={S.stampBtn} className="fk-btn" onClick={() => startRun(tmpl)}>
-                        Starta rondering
+                  <button style={S.miniDelete} onClick={() => removeTemplate(tmpl.id)} aria-label="Ta bort checklista">×</button>
+                </div>
+
+                {/* Periodrutnät: en ruta per period (vecka/månad/år). Grön ✓ =
+                    bekräftad, gul = påbörjad. Tryck på en ruta för att pricka av. */}
+                <div style={{ display: "flex", gap: 6, overflowX: "auto", paddingBottom: 4, marginTop: 6 }}>
+                  {periods.map((pk) => {
+                    const run = runFor(tmpl.id, pk, interval);
+                    const done = !!run?.done;
+                    const partial = run && !done && run.checkedItemIds.length > 0;
+                    const isActive = active && active.templateId === tmpl.id && active.period === pk;
+                    const isCurrent = pk === currentKey;
+                    return (
+                      <button
+                        key={pk}
+                        className="fk-btn"
+                        onClick={() => openPeriod(tmpl, pk)}
+                        style={{
+                          flex: "0 0 auto",
+                          minWidth: 52,
+                          padding: "6px 8px",
+                          borderRadius: 6,
+                          cursor: "pointer",
+                          border: isActive
+                            ? "2px solid #2B6E5E"
+                            : `1px solid ${done ? "#2B6E5E" : partial ? "#C49A2A" : "#C9C4B7"}`,
+                          background: done ? "#2B6E5E" : "#fff",
+                          color: done ? "#fff" : "#3A413C",
+                          display: "flex",
+                          flexDirection: "column",
+                          alignItems: "center",
+                          gap: 2,
+                        }}
+                      >
+                        <span style={{ fontSize: 11, fontWeight: 600 }}>{shortPeriodLabel(pk, interval)}</span>
+                        <span style={{ fontSize: 12, fontWeight: 700 }}>
+                          {done ? "✓" : partial ? `${run.checkedItemIds.length}/${tmpl.items.length}` : "–"}
+                        </span>
+                        <span style={{ fontSize: 9, opacity: 0.7, minHeight: 11 }}>{isCurrent ? "nu" : ""}</span>
                       </button>
-                    )}
-                    <button style={S.miniDelete} onClick={() => removeTemplate(tmpl.id)} aria-label="Ta bort checklista">×</button>
-                  </div>
+                    );
+                  })}
                 </div>
 
                 {activeRun && (
                   <div style={S.runBox}>
+                    <div style={{ ...S.rowSub, marginBottom: 6, fontWeight: 600 }}>
+                      {periodLabel(activeRun.period || active.period, interval)}
+                      {activeRun.done ? " · bekräftad" : ""}
+                    </div>
                     {tmpl.items.map((item) => {
                       const checked = activeRun.checkedItemIds.includes(item.id);
                       return (
@@ -1681,24 +2581,31 @@ function Checklistor({ state, setState, scopedProps, actor, notify }) {
                     })}
                     <div style={S.runFooter}>
                       <span style={S.rowSub}>
-                        {activeRun.checkedItemIds.length}/{tmpl.items.length} avbockade · {activeRun.doneBy}
+                        {activeRun.checkedItemIds.length}/{tmpl.items.length} avbockade{activeRun.done ? ` · ${activeRun.doneBy}` : ""}
                       </span>
-                      <button
-                        style={S.primaryBtnSmall}
-                        className="fk-btn"
-                        onClick={() => finishRun(activeRun, tmpl.items.length)}
-                      >
-                        Markera klar
-                      </button>
+                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                        {!activeRun.done ? (
+                          <button style={S.primaryBtnSmall} className="fk-btn" onClick={() => confirmRun(activeRun)}>
+                            Bekräfta perioden
+                          </button>
+                        ) : (
+                          <button style={S.secondaryBtnSmall || S.secondaryBtn} className="fk-btn" onClick={() => reopenRun(activeRun)}>
+                            Ångra bekräftelse
+                          </button>
+                        )}
+                        <button style={S.linkBtn} className="fk-btn" onClick={() => setActive(null)}>
+                          Stäng
+                        </button>
+                      </div>
                     </div>
                   </div>
                 )}
 
-                {runs.length > 0 && (
-                  <div style={S.historyRow}>
-                    Senast: {fmtDate(runs[0].date)} av {runs[0].doneBy} ({runs[0].checkedItemIds.length}/{tmpl.items.length})
-                  </div>
-                )}
+                <div style={S.historyRow}>
+                  {last
+                    ? `Senast bekräftad: ${periodLabel(last.period || periodKey(last.date, interval), interval)} av ${last.doneBy}`
+                    : "Ingen period bekräftad ännu — tryck på en ruta för att pricka av."}
+                </div>
               </div>
             );
           })}
@@ -1712,12 +2619,13 @@ function ChecklistForm({ properties, onSubmit }) {
   const [title, setTitle] = useState("");
   const [itemsText, setItemsText] = useState("");
   const [propertyId, setPropertyId] = useState(properties[0]?.id || "");
+  const [interval, setInterval] = useState("vecka");
 
   const submit = (e) => {
     e.preventDefault();
     const items = itemsText.split("\n").map((s) => s.trim()).filter(Boolean);
     if (!title.trim() || !propertyId || items.length === 0) return;
-    onSubmit({ title: title.trim(), propertyId, items });
+    onSubmit({ title: title.trim(), propertyId, interval, items });
   };
 
   return (
@@ -1728,6 +2636,17 @@ function ChecklistForm({ properties, onSubmit }) {
           <input className="fk-input" style={S.input} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="t.ex. Veckorondering källare" required />
         </label>
         <PropertyPicker properties={properties} value={propertyId} onChange={setPropertyId} />
+      </div>
+      <div style={S.formRow}>
+        <label style={S.label}>
+          Intervall
+          <select className="fk-input" style={S.input} value={interval} onChange={(e) => setInterval(e.target.value)}>
+            {CHECKLIST_INTERVALS.map((iv) => (
+              <option key={iv} value={iv}>{iv === "vecka" ? "Varje vecka" : iv === "månad" ? "Varje månad" : "Varje år"}</option>
+            ))}
+          </select>
+        </label>
+        <div />
       </div>
       <label style={S.label}>
         Punkter (en per rad)
@@ -1898,14 +2817,15 @@ function createBillingActions(state, setState, actor, notify) {
       .filter((e) => !e.invoicedInBasisId)
       .reduce((s, e) => s + Number(e.hours || 0), 0);
 
-  const rateFor = (order) => {
+  // Timpriset kommer från föreningens avtal, om inte fastigheten har ett eget.
+  const rateForOrder = (order) => {
     const property = state.properties.find((p) => p.id === order.propertyId);
-    return Number(property?.rates?.[order.priceCategory] || 0);
+    return rateFor(state, property, order.priceCategory);
   };
 
   const billRateFor = (order) => {
     const property = state.properties.find((p) => p.id === order.propertyId);
-    return Number(property?.rates?.BIL || 0);
+    return rateFor(state, property, "BIL");
   };
 
   const addOrder = (type, payload) => {
@@ -1943,17 +2863,22 @@ function createBillingActions(state, setState, actor, notify) {
     notify(`${order.title} makulerad`);
   };
 
-  const setOrderStatus = (order, status) => {
+  const setOrderStatus = (order, status, reason) => {
+    const now = todayISO();
+    const entry =
+      status === "Klar"
+        ? { datum: now, av: actor || "Okänd", handelse: "Klarmarkerad" }
+        : { datum: now, av: actor || "Okänd", handelse: "Återöppnad", kommentar: (reason || "").trim() };
     setState({
       ...state,
       billableOrders: state.billableOrders.map((o) =>
         o.id === order.id
-          ? { ...o, status, completedAt: status === "Klar" ? todayISO() : null }
+          ? { ...o, status, completedAt: status === "Klar" ? now : null, logg: [...(o.logg || []), entry] }
           : o
       ),
     });
     if (status === "Klar") notify(`${order.title} klarmarkerad — flyttad till Debitering`);
-    else notify(`${order.title} återöppnad`);
+    else notify(`${order.title} återöppnad — loggat`);
   };
 
   const updateBillCount = (order, count) => {
@@ -1985,7 +2910,7 @@ function createBillingActions(state, setState, actor, notify) {
       title: order.title,
       createdAt: todayISO(),
       createdBy: actor || "Okänd",
-      rate: rateFor(order),
+      rate: rateForOrder(order),
       loggedHours: unbilled.reduce((s, e) => s + Number(e.hours || 0), 0),
       adjustedHours: Number(adjustedHours),
       note: note.trim(),
@@ -2121,7 +3046,7 @@ function Debitering({ state, scopedProps, billing, notify }) {
         onBack={() => setOpenOrderId(null)}
         onAddEntry={(payload) => billing.addTimeEntry(openOrder, payload)}
         onRemoveEntry={billing.removeTimeEntry}
-        onReopen={() => billing.setOrderStatus(openOrder, "Pågår")}
+        onReopen={(reason) => billing.setOrderStatus(openOrder, "Pågår", reason)}
         onCreateBasis={(hours, note) => billing.createBasis(openOrder, hours, note)}
         onUpdateBasisHours={billing.updateBasisHours}
         onPrintBasis={(basis) => setPrintingBasis({ basis, order: openOrder, entries: billing.entriesFor(openOrder.id).filter((e) => (basis.entryIds || []).includes(e.id)) })}
@@ -2388,7 +3313,7 @@ function ArendeQueue({ type, title, newLabel, titleFieldLabel, titlePlaceholder,
         }
         onReopen={
           !openOrder.cancelled && openOrder.status === "Klar"
-            ? () => billing.setOrderStatus(openOrder, "Pågår")
+            ? (reason) => billing.setOrderStatus(openOrder, "Pågår", reason)
             : undefined
         }
         onCreateBasis={(hours, note) => billing.createBasis(openOrder, hours, note)}
@@ -2683,6 +3608,7 @@ function OrderDetail({
   const [showEntryForm, setShowEntryForm] = useState(false);
   const [showBasisForm, setShowBasisForm] = useState(false);
   const [confirmingReopen, setConfirmingReopen] = useState(false);
+  const [reopenReason, setReopenReason] = useState("");
   const [showCancelPanel, setShowCancelPanel] = useState(false);
   const [cancelReason, setCancelReason] = useState("");
   const bilLocked = !!order.billInvoicedInBasisId;
@@ -2698,13 +3624,11 @@ function OrderDetail({
     onCancel(cancelReason);
   };
 
-  const handleReopenClick = () => {
-    if (hasExistingBasis && !confirmingReopen) {
-      setConfirmingReopen(true);
-      return;
-    }
+  const confirmReopen = () => {
+    if (!reopenReason.trim()) return;
     setConfirmingReopen(false);
-    onReopen();
+    onReopen(reopenReason);
+    setReopenReason("");
   };
 
   return (
@@ -2739,7 +3663,7 @@ function OrderDetail({
           </button>
         )}
         {!readOnly && onReopen && !confirmingReopen && (
-          <button style={S.secondaryBtn} className="fk-btn" onClick={handleReopenClick}>
+          <button style={S.secondaryBtn} className="fk-btn" onClick={() => setConfirmingReopen(true)}>
             Återöppna ärendet
           </button>
         )}
@@ -2754,19 +3678,49 @@ function OrderDetail({
 
       {confirmingReopen && (
         <div style={{ ...S.checklistCardPending, marginBottom: 18 }}>
-          <div style={S.rowTitle}>Det här ärendet är redan delvis fakturerat</div>
-          <div style={{ ...S.rowSub, marginTop: 6 }}>
-            Det som redan fakturerats påverkas inte och förblir låst. Ny tid du loggar efter
-            återöppning går att fakturera separat senare, som ett eget underlag.
+          <div style={S.rowTitle}>Återöppna ärendet</div>
+          {hasExistingBasis && (
+            <div style={{ ...S.rowSub, marginTop: 6 }}>
+              Ärendet är redan delvis fakturerat. Det som fakturerats påverkas inte och förblir låst.
+              Ny tid du loggar efter återöppning går att fakturera separat senare, som ett eget underlag.
+            </div>
+          )}
+          <div style={{ ...S.rowSub, marginTop: 8, marginBottom: 4 }}>
+            Ange varför ärendet återöppnas — det sparas i ärendets logg tillsammans med vem och när.
           </div>
-          <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-            <button style={S.secondaryBtn} className="fk-btn" onClick={handleReopenClick}>
-              Återöppna ändå
+          <input
+            className="fk-input"
+            style={S.input}
+            value={reopenReason}
+            onChange={(e) => setReopenReason(e.target.value)}
+            placeholder="t.ex. Kompletterande arbete efter återbesök"
+            autoFocus
+          />
+          <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+            <button
+              style={{ ...S.secondaryBtn, opacity: reopenReason.trim() ? 1 : 0.5 }}
+              className="fk-btn"
+              disabled={!reopenReason.trim()}
+              onClick={confirmReopen}
+            >
+              Bekräfta återöppning
             </button>
-            <button style={S.linkBtn} onClick={() => setConfirmingReopen(false)}>
+            <button style={S.linkBtn} onClick={() => { setConfirmingReopen(false); setReopenReason(""); }}>
               Avbryt
             </button>
           </div>
+        </div>
+      )}
+
+      {(order.logg || []).length > 0 && (
+        <div style={{ ...S.rowSub, marginBottom: 14, fontSize: 12 }}>
+          <div style={{ fontWeight: 600, marginBottom: 2 }}>Logg</div>
+          {(order.logg || []).map((l, i) => (
+            <div key={i} style={{ marginBottom: 2 }}>
+              {l.handelse} {fmtDate(l.datum)} av {l.av}
+              {l.kommentar ? <span style={{ color: "#B07A16" }}> — {l.kommentar}</span> : null}
+            </div>
+          ))}
         </div>
       )}
 
@@ -3133,7 +4087,7 @@ function buildBasisPdf(basis, order, propertyName, propertyAddress, entries) {
     doc.text(String(value), x, y + 15);
     doc.setFont("helvetica", "normal");
   };
-  metaCol("Bostadsrättsförening", propertyName, marginX);
+  metaCol("Fastighet", propertyName, marginX);
   metaCol("Ordernummer", `#${order.orderNumber}`, marginX + 210);
   metaCol("Ärende/order", order.title, marginX + 330);
 
@@ -3281,7 +4235,7 @@ function PrintableBasis({ basis, order, propertyName, propertyAddress, entries, 
 
         <div style={S.invoiceMetaGrid}>
           <div>
-            <div style={S.invoiceMetaLabel}>Bostadsrättsförening</div>
+            <div style={S.invoiceMetaLabel}>Fastighet</div>
             <div style={S.invoiceMetaValue}>{propertyName}</div>
           </div>
           <div>
@@ -3373,7 +4327,8 @@ function Backup({ state, setState, notify, lastSavedAt }) {
   const fileInputRef = React.useRef(null);
 
   const counts = {
-    Bostadsrättsföreningar: state.properties.length,
+    Föreningar: (state.organizations || []).length,
+    Fastigheter: state.properties.length,
     Uppgifter: state.tasks.length,
     Checklistor: state.checklistTemplates.length,
     Ärenden: state.issues.length,
@@ -3409,7 +4364,8 @@ function Backup({ state, setState, notify, lastSavedAt }) {
           throw new Error("Filen innehåller inte ett igenkännbart N2 Fastighetsservice och Förvaltning AB-underlag.");
         }
         const summary = {
-          Bostadsrättsföreningar: data.properties?.length || 0,
+          Föreningar: data.organizations?.length || 0,
+          Fastigheter: data.properties?.length || 0,
           Uppgifter: data.tasks?.length || 0,
           Checklistor: data.checklistTemplates?.length || 0,
           Ärenden: data.issues?.length || 0,
@@ -3466,7 +4422,7 @@ function Backup({ state, setState, notify, lastSavedAt }) {
       <div style={S.panel}>
         <h3 style={S.panelTitle}>Ladda ner backup</h3>
         <p style={{ ...S.rowSub, marginBottom: 12 }}>
-          Sparar all information (bostadsrättsföreningar, uppgifter, checklistor, ärenden, debitering) som en
+          Sparar all information (föreningar, fastigheter, uppgifter, checklistor, ärenden, debitering) som en
           JSON-fil på din enhet.
         </p>
         <button style={S.primaryBtn} className="fk-btn" onClick={downloadBackup}>
@@ -3524,6 +4480,1936 @@ function Backup({ state, setState, notify, lastSavedAt }) {
 
 /* ------------------------------ kalender ------------------------------ */
 
+
+/* ------------------------------ driftrapporter ------------------------------ */
+
+const monthLabel = (ym) => {
+  if (!ym) return "";
+  const [y, m] = ym.split("-");
+  const d = new Date(Number(y), Number(m) - 1, 1);
+  return d.toLocaleDateString("sv-SE", { month: "long", year: "numeric" });
+};
+const thisMonthISO = () => todayISO().slice(0, 7);
+
+/* --- Perioder för återkommande checklistor (vecka/månad/år) --- */
+const CHECKLIST_INTERVALS = ["vecka", "månad", "år"];
+const periodCount = (interval) => (interval === "år" ? 5 : 12);
+
+// ISO-veckonummer (måndag som veckans start, torsdagsregeln).
+function isoWeek(d) {
+  const date = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  const dayNum = (date.getUTCDay() + 6) % 7;
+  date.setUTCDate(date.getUTCDate() - dayNum + 3);
+  const firstThursday = new Date(Date.UTC(date.getUTCFullYear(), 0, 4));
+  const firstDayNum = (firstThursday.getUTCDay() + 6) % 7;
+  firstThursday.setUTCDate(firstThursday.getUTCDate() - firstDayNum + 3);
+  const week = 1 + Math.round((date - firstThursday) / (7 * 86400000));
+  return { year: date.getUTCFullYear(), week };
+}
+
+// Nyckel för perioden ett datum tillhör (t.ex. "2026-v30", "2026-08", "2026").
+function periodKey(dateLike, interval) {
+  const d = typeof dateLike === "string" ? new Date(dateLike) : dateLike;
+  if (interval === "år") return `${d.getFullYear()}`;
+  if (interval === "månad") return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+  const { year, week } = isoWeek(d);
+  return `${year}-v${String(week).padStart(2, "0")}`;
+}
+
+// Kort etikett till kolumnrutorna.
+function shortPeriodLabel(key, interval) {
+  if (interval === "år") return key;
+  if (interval === "månad") {
+    const [y, m] = key.split("-");
+    return new Date(Number(y), Number(m) - 1, 1).toLocaleDateString("sv-SE", { month: "short" });
+  }
+  return `v.${Number(key.split("-v")[1])}`;
+}
+
+// Lång etikett (t.ex. i "senast bekräftad").
+function periodLabel(key, interval) {
+  if (interval === "år") return key;
+  if (interval === "månad") return monthLabel(key);
+  const [y, w] = key.split("-v");
+  return `v.${Number(w)} ${y}`;
+}
+
+// De senaste `count` perioderna, äldst först och innevarande sist.
+function recentPeriods(interval, count) {
+  const keys = [];
+  const now = new Date();
+  for (let i = count - 1; i >= 0; i--) {
+    const d = new Date(now);
+    if (interval === "år") d.setFullYear(now.getFullYear() - i);
+    else if (interval === "månad") d.setMonth(now.getMonth() - i);
+    else d.setDate(now.getDate() - i * 7);
+    keys.push(periodKey(d, interval));
+  }
+  return keys;
+}
+
+/* Graddagar-redigering: gemensam serie för alla föreningar, med möjlighet att
+   slå på en egen serie per förening (säkerhetsfunktion vid annan leverantör). */
+function GraddagarPanel({ state, setState, org, notify }) {
+  const [open, setOpen] = useState(false);
+  const [year, setYear] = useState(new Date().getFullYear());
+  // Ändringar hamnar först i ett utkast och skrivs till riktiga datat när
+  // man trycker "Spara graddagar" — så att man aktivt bekräftar, precis som
+  // i de andra formulären. { "2026-01": { faktisk: 820, normal: 750 } }
+  const [draft, setDraft] = useState({});
+  const dirty = Object.keys(draft).length > 0;
+
+  const useOwn = !!org?.useOwnKlimat;
+  const source = useOwn ? org.klimatdata || {} : state.klimatdata || {};
+
+  const displayValue = (ym, field) =>
+    draft[ym]?.[field] !== undefined ? draft[ym][field] : source?.[ym]?.[field] ?? "";
+
+  const setValue = (ym, field, raw) => {
+    const val = raw === "" ? "" : Number(raw);
+    setDraft((d) => ({ ...d, [ym]: { ...d[ym], [field]: val } }));
+  };
+
+  const saveDraft = () => {
+    // Spara ska ALLTID stänga panelen — även om inget hunnit ändras, så att
+    // knappen aldrig känns död. Skrivning + bekräftelse sker bara när det
+    // faktiskt finns ändringar att spara.
+    if (!dirty) {
+      setOpen(false);
+      return;
+    }
+    const merged = { ...source };
+    Object.entries(draft).forEach(([ym, fields]) => {
+      merged[ym] = { ...merged[ym], ...fields };
+    });
+    if (useOwn) {
+      setState({
+        ...state,
+        organizations: state.organizations.map((o) => (o.id === org.id ? { ...o, klimatdata: merged } : o)),
+      });
+      notify(`Graddagar sparade för ${org.name}`);
+    } else {
+      setState({ ...state, klimatdata: merged });
+      notify("Graddagar sparade (gemensam serie — gäller alla föreningar)");
+    }
+    setDraft({});
+    // Stäng panelen när ändringarna är bekräftade — som ett avslutat formulär.
+    setOpen(false);
+  };
+
+  const discardDraft = () => setDraft({});
+
+  const toggleOwn = (checked) => {
+    // Byte av serie kastar osparade ändringar — annars är det otydligt vilken
+    // serie utkastet skulle ha hamnat i.
+    setDraft({});
+    setState({
+      ...state,
+      organizations: state.organizations.map((o) => (o.id === org.id ? { ...o, useOwnKlimat: checked } : o)),
+    });
+    notify(
+      checked
+        ? `${org.name} använder nu en egen graddagsserie`
+        : `${org.name} använder nu den gemensamma graddagsserien`
+    );
+  };
+
+  const months = Array.from({ length: 12 }, (_, i) => `${year}-${String(i + 1).padStart(2, "0")}`);
+
+  return (
+    <div style={{ ...S.checklistCard, marginBottom: 14 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+        <div>
+          <div style={S.taskCardTitle}>Graddagar (normalårskorrigering)</div>
+          <div style={{ ...S.rowSub, marginTop: 2 }}>
+            {useOwn
+              ? `Egen serie för ${org.name} — används i stället för den gemensamma.`
+              : "Gemensam serie — samma graddagar används för alla föreningar."}
+          </div>
+        </div>
+        <button style={S.stampBtn} className="fk-btn" onClick={() => setOpen(!open)}>
+          {open ? "Dölj" : "Visa/redigera"}
+        </button>
+      </div>
+
+      {open && (
+        <div style={{ marginTop: 12 }}>
+          {org && (
+            <label style={{ ...S.rowSub, display: "flex", alignItems: "center", gap: 8, marginBottom: 10, cursor: "pointer" }}>
+              <input type="checkbox" checked={useOwn} onChange={(e) => toggleOwn(e.target.checked)} />
+              Egen graddagsserie för {org.name} (annan fjärrvärmeleverantör)
+            </label>
+          )}
+          <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
+            <button style={S.stampBtn} className="fk-btn" onClick={() => setYear(year - 1)}>‹</button>
+            <strong>{year}</strong>
+            <button style={S.stampBtn} className="fk-btn" onClick={() => setYear(year + 1)}>›</button>
+          </div>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ borderCollapse: "collapse", fontSize: 13, width: "100%" }}>
+              <thead>
+                <tr style={{ textAlign: "left", color: "#5C594E" }}>
+                  <th style={{ padding: "4px 8px 4px 0" }}>Månad</th>
+                  <th style={{ padding: "4px 8px" }}>Faktiska graddagar</th>
+                  <th style={{ padding: "4px 8px" }}>Normalår</th>
+                </tr>
+              </thead>
+              <tbody>
+                {months.map((ym) => (
+                  <tr key={ym} style={{ borderTop: "1px solid #C9C4B7" }}>
+                    <td style={{ padding: "4px 8px 4px 0", whiteSpace: "nowrap" }}>{monthLabel(ym)}</td>
+                    {["faktisk", "normal"].map((field) => (
+                      <td key={field} style={{ padding: "4px 8px" }}>
+                        <input
+                          className="fk-input"
+                          style={{ ...S.input, maxWidth: 110, padding: "6px 8px" }}
+                          type="number"
+                          min="0"
+                          value={displayValue(ym, field)}
+                          placeholder="—"
+                          onChange={(e) => setValue(ym, field, e.target.value)}
+                        />
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div style={{ ...S.rowSub, marginTop: 8 }}>
+            Hämtas t.ex. från SMHI eller energibolaget. Utan graddagar visas fortfarande faktisk
+            förbrukning, Q/W och kWh/m² — normalårskorrigeringen tillkommer när serien är ifylld.
+          </div>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 12, flexWrap: "wrap" }}>
+            <button style={S.addBtn} className="fk-btn" onClick={saveDraft}>
+              Spara graddagar
+            </button>
+            {dirty && (
+              <>
+                <button style={S.secondaryBtn} className="fk-btn" onClick={discardDraft}>
+                  Ångra ändringar
+                </button>
+                <span style={{ fontSize: 13, color: "#C4171C" }}>
+                  Osparade ändringar — tryck Spara för att bekräfta
+                </span>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* Nyckeltalspanel + avvikelser för den senaste månaden med fjärrvärmedata. */
+function DriftAnalys({ state, allReports, org }) {
+  const withDh = allReports
+    .filter((r) => r.orgId === org.id && dhEffective(allReports, r) != null)
+    .sort((a, b) => (a.month < b.month ? 1 : -1));
+  const latest = withDh[0];
+  if (!latest) {
+    return (
+      <div style={{ ...S.rowSub, marginBottom: 14 }}>
+        Fyll i undercentralens mätarställning (MWh + m³) i en driftrapport så räknas Q/W, kWh/m² och
+        normalårskorrigerad förbrukning ut automatiskt här.
+      </div>
+    );
+  }
+  const now = dhKpis(state, allReports, org, latest);
+  const prevReport = reportPrevYear(allReports, latest);
+  const prev = prevReport ? dhKpis(state, allReports, org, prevReport) : null;
+  const dev = dhDeviations(state, allReports, org);
+  const causes = dhCauseAnalysis(state, allReports, org, latest);
+
+  const dFakt = fmtPct(pctDiff(now.mwh, prev?.mwh));
+  const dKorr = fmtPct(pctDiff(now.korr, prev?.korr));
+  const dQw = fmtPct(pctDiff(now.qw, prev?.qw));
+
+  const blocks = [
+    { value: `${fmtNum(now.mwh)} MWh`, label: `Fjärrvärme ${monthLabel(latest.month)}${dFakt ? ` (${dFakt} mot fg år)` : ""}` },
+    {
+      value: now.korr != null ? `${fmtNum(now.korr)} MWh` : "—",
+      label: now.korr != null ? `Normalårskorrigerat${dKorr ? ` (${dKorr})` : ""}` : "Normalårskorrigerat (graddagar saknas)",
+    },
+    { value: fmtNum(now.qw), label: `Q/W — avkylning (m³/MWh)${dQw ? ` (${dQw})` : ""}` },
+    {
+      value: now.kwhm2Korr != null || now.kwhm2 != null ? fmtNum(now.kwhm2Korr ?? now.kwhm2) : "—",
+      label: now.kwhm2Korr != null ? "kWh/m² (normalårskorr.)" : now.kwhm2 != null ? "kWh/m² (faktiskt)" : "kWh/m² (Atemp saknas)",
+    },
+  ];
+
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <div style={S.kpiRow}>
+        {blocks.map((b, i) => (
+          <div key={i} style={S.kpiBlock}>
+            <div style={S.kpiValue}>{b.value}</div>
+            <div style={S.kpiLabel}>{b.label}</div>
+          </div>
+        ))}
+      </div>
+
+      {(dev.warnings.length > 0 || dev.infos.length > 0) && (
+        <div
+          style={{
+            marginTop: 10,
+            padding: "10px 14px",
+            border: `1px solid ${dev.warnings.length ? "#C4171C" : "#C9C4B7"}`,
+            borderRadius: 8,
+            fontSize: 13,
+            color: "#1C2321",
+          }}
+        >
+          {dev.warnings.map((w, i) => (
+            <div key={`w${i}`} style={{ color: "#C4171C", marginBottom: 4 }}>⚠ {w}</div>
+          ))}
+          {dev.infos.map((t, i) => (
+            <div key={`i${i}`} style={{ color: "#5C594E", marginBottom: 4 }}>ⓘ {t}</div>
+          ))}
+        </div>
+      )}
+
+      {causes.length > 0 && (
+        <div
+          style={{
+            marginTop: 10,
+            padding: "10px 14px",
+            border: "1px solid #C9C4B7",
+            borderRadius: 8,
+            fontSize: 13,
+            color: "#1C2321",
+          }}
+        >
+          <div style={{ fontWeight: 700, marginBottom: 6 }}>Trolig orsak (automatisk bedömning)</div>
+          {causes.map((c, i) => (
+            <div key={i} style={{ color: "#5C594E", marginBottom: 4 }}>• {c}</div>
+          ))}
+          <div style={{ color: "#8a8578", fontSize: 12, marginTop: 4 }}>
+            Bedömningen bygger på nyckeltalens mönster — verifiera vid nästa driftbesök. Texten följer med i PDF-rapporten.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* Flerårsöversikt i samma uppställning som den klassiska Excelmallen:
+   år sida vid sida, per månad: omräknad förbrukning till normalår (MWh),
+   avläst förbrukning flöde (m³), Q/W och kWh/m² — med årssummor längst ner.
+   "Omräknad till normalår" hämtas automatiskt från graddagsserien; saknas
+   graddagar för en månad visas faktisk förbrukning markerad med *. */
+function FlerarsMatris({ state, allReports, org }) {
+  const rows = allReports.filter((r) => r.orgId === org.id && dhEffective(allReports, r) != null);
+  const years = [...new Set(rows.map((r) => r.month.slice(0, 4)))].sort().reverse().slice(0, 3);
+  if (years.length === 0) return null;
+
+  const MONTHS_SHORT = ["jan", "feb", "mar", "apr", "maj", "jun", "jul", "aug", "sep", "okt", "nov", "dec"];
+  const get = (yy, mi) => {
+    const r = rows.find((x) => x.month === `${yy}-${String(mi + 1).padStart(2, "0")}`);
+    return r ? dhKpis(state, allReports, org, r) : null;
+  };
+
+  const td = { padding: "3px 8px", textAlign: "right", whiteSpace: "nowrap", fontSize: 12 };
+  const groupBorder = { borderLeft: "1px solid #C9C4B7" };
+  const th = { ...td, color: "#5C594E", fontWeight: 600 };
+
+  // Årssummor: omräknad energi summeras; Q/W för året = totalt flöde /
+  // total FAKTISK energi (fysiskt mått); kWh/m² på omräknad energi.
+  const totals = years.map((yy) => {
+    let korr = 0, fakt = 0, m3 = 0, any = false, starred = false;
+    for (let mi = 0; mi < 12; mi++) {
+      const k = get(yy, mi);
+      if (!k) continue;
+      any = true;
+      fakt += k.mwh || 0;
+      m3 += k.m3 || 0;
+      if (k.korr != null) korr += k.korr;
+      else {
+        korr += k.mwh || 0;
+        starred = true;
+      }
+    }
+    return {
+      any,
+      starred,
+      korr,
+      m3,
+      qw: fakt > 0 && m3 > 0 ? m3 / fakt : null,
+      kwhm2: orgAtemp(state, org) > 0 && korr > 0 ? (korr * 1000) / orgAtemp(state, org) : null,
+    };
+  });
+
+  return (
+    <div style={{ ...S.checklistCard, marginBottom: 14, overflowX: "auto" }}>
+      <div style={{ ...S.taskCardTitle, marginBottom: 8 }}>Flerårsöversikt — fjärrvärme</div>
+      <table style={{ borderCollapse: "collapse", width: "100%" }}>
+        <thead>
+          <tr>
+            <th style={{ ...th, textAlign: "left" }}></th>
+            {years.map((yy) => (
+              <th key={yy} colSpan={4} style={{ ...th, ...groupBorder, textAlign: "center", fontSize: 13 }}>
+                {yy}
+              </th>
+            ))}
+          </tr>
+          <tr>
+            <th style={{ ...th, textAlign: "left" }}>Månad</th>
+            {years.map((yy) => (
+              <React.Fragment key={yy}>
+                <th style={{ ...th, ...groupBorder }} title="Omräknad förbrukning till normalår">MWh norm.</th>
+                <th style={th} title="Avläst förbrukning, flöde">m³</th>
+                <th style={th}>Q/W</th>
+                <th style={th} title="Omräknad förbrukning ger kWh/m²">kWh/m²</th>
+              </React.Fragment>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {MONTHS_SHORT.map((mn, mi) => (
+            <tr key={mn} style={{ borderTop: "1px solid #E4E0D5" }}>
+              <td style={{ ...td, textAlign: "left", fontWeight: 600 }}>{mn}</td>
+              {years.map((yy) => {
+                const k = get(yy, mi);
+                return (
+                  <React.Fragment key={yy}>
+                    <td style={{ ...td, ...groupBorder }}>
+                      {k ? (k.korr != null ? fmtNum(k.korr, 0) : `${fmtNum(k.mwh, 0)}*`) : ""}
+                    </td>
+                    <td style={td}>{k && k.m3 != null ? fmtNum(k.m3, 0) : ""}</td>
+                    <td style={td}>{k && k.qw != null ? fmtNum(k.qw, 0) : ""}</td>
+                    <td style={td}>{k ? (k.kwhm2Korr != null ? fmtNum(k.kwhm2Korr) : k.kwhm2 != null ? `${fmtNum(k.kwhm2)}*` : "") : ""}</td>
+                  </React.Fragment>
+                );
+              })}
+            </tr>
+          ))}
+          <tr style={{ borderTop: "2px solid #C9C4B7", fontWeight: 700 }}>
+            <td style={{ ...td, textAlign: "left" }}>Summa</td>
+            {years.map((yy, i) => {
+              const t = totals[i];
+              return (
+                <React.Fragment key={yy}>
+                  <td style={{ ...td, ...groupBorder }}>{t.any ? `${fmtNum(t.korr, 0)}${t.starred ? "*" : ""}` : ""}</td>
+                  <td style={td}>{t.any && t.m3 > 0 ? fmtNum(t.m3, 0) : ""}</td>
+                  <td style={td}>{t.qw != null ? fmtNum(t.qw, 0) : ""}</td>
+                  <td style={td}>{t.kwhm2 != null ? fmtNum(t.kwhm2, 0) : ""}</td>
+                </React.Fragment>
+              );
+            })}
+          </tr>
+        </tbody>
+      </table>
+      <div style={{ ...S.rowSub, marginTop: 8 }}>
+        "MWh norm." = förbrukningen omräknad till normalår via graddagsserien (endast uppvärmningsdelen korrigeras — varmvattnets bastal hålls utanför). * = faktisk förbrukning,
+        graddagar saknas för månaden — fyll i dem under Graddagar så räknas kolumnen om automatiskt.
+        Q/W för året beräknas på totalt flöde mot total faktisk energi.
+      </div>
+    </div>
+  );
+}
+
+function Driftrapporter({ state, setState, scopedProps, selectedOrg, actor, notify }) {
+  // Föreningen för det aktuella urvalet. Rapporten adresseras alltid till
+  // föreningen — även när den bara omfattar en av dess fastigheter.
+  const org =
+    selectedOrg ||
+    (state.organizations || []).find((o) => o.id === scopedProps[0]?.orgId) ||
+    null;
+  // Mottagare: föreningens e-post i första hand, annars första kontakten med
+  // adress, annars en kontakt på fastigheten.
+  const mottagare =
+    org?.email ||
+    (org?.contacts || []).find((c) => c.email)?.email ||
+    (scopedProps[0]?.contacts || []).find((c) => c.email)?.email ||
+    "";
+  const [showForm, setShowForm] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+  const [sendingEmail, setSendingEmail] = useState(false);
+
+  // Formuläret ska ALDRIG vara öppet av sig självt — det visas först när man
+  // trycker "+ Skapa ny driftrapport" (eller Redigera). Byter man förening
+  // högst upp stängs ett ev. öppet formulär så inget hänger kvar felaktigt.
+  const scopeKey = scopedProps.map((p) => p.id).join(",");
+  useEffect(() => {
+    setShowForm(false);
+    setEditingId(null);
+    setConfirmDeleteId(null);
+  }, [scopeKey]);
+
+  // En driftrapport per förening och månad — inget urval per fastighet behövs.
+  const showPropertyTag = false;
+  const propName = (id) => state.properties.find((p) => p.id === id)?.name || "";
+
+  const allReports = state.utilityReports || [];
+  const reports = allReports
+    .filter((r) => org && r.orgId === org.id)
+    .sort((a, b) => (a.month < b.month ? 1 : -1));
+
+  const editingReport = editingId ? reports.find((r) => r.id === editingId) : null;
+
+  const saveReport = (payload) => {
+    // Spärr: går inte att rapportera en månad som inte inträffat ännu —
+    // gäller både nya rapporter och när man redigerar en befintlig.
+    if (payload.month > thisMonthISO()) {
+      notify(`${monthLabel(payload.month)} ligger i framtiden — det går bara att rapportera till och med innevarande månad`);
+      return;
+    }
+    if (editingId) {
+      const collision = (state.utilityReports || []).find(
+        (r) => r.id !== editingId && r.orgId === payload.orgId && r.month === payload.month
+      );
+      if (collision) {
+        notify(`${monthLabel(payload.month)} finns redan registrerad för föreningen — välj en annan månad`);
+        return;
+      }
+      setState({
+        ...state,
+        utilityReports: state.utilityReports.map((r) => (r.id === editingId ? { ...r, ...payload } : r)),
+      });
+      notify("Driftrapport uppdaterad");
+    } else {
+      // Skydda historiken: varje förening får EN rapport per månad. Finns
+      // månaden redan skapas ingen dubblett — redigera den befintliga i stället.
+      const exists = (state.utilityReports || []).find(
+        (r) => r.orgId === payload.orgId && r.month === payload.month
+      );
+      if (exists) {
+        notify(`${monthLabel(payload.month)} finns redan registrerad — öppna den via Redigera i stället`);
+        return;
+      }
+      const report = { id: uid(), ...payload, recordedBy: actor || "Okänd", recordedAt: todayISO() };
+      setState({ ...state, utilityReports: [...(state.utilityReports || []), report] });
+      notify("Driftrapport sparad");
+    }
+    setShowForm(false);
+    setEditingId(null);
+  };
+
+  const startEdit = (r) => {
+    if (r.klar) {
+      notify("Rapporten är klarmarkerad — lås upp den först för att justera");
+      return;
+    }
+    setEditingId(r.id);
+    setShowForm(true);
+    // Formuläret ligger ovanför listan — scrolla dit så det syns att
+    // redigeringen faktiskt öppnats (annars ser knappen "död" ut på långa listor).
+    setTimeout(() => window.scrollTo({ top: 0, behavior: "smooth" }), 50);
+  };
+
+  const markKlar = (r) => {
+    setState({
+      ...state,
+      utilityReports: state.utilityReports.map((x) =>
+        x.id === r.id
+          ? {
+              ...x,
+              klar: true,
+              klarAt: todayISO(),
+              klarAv: actor || "Okänd",
+              laslogg: [...(x.laslogg || []), { datum: todayISO(), av: actor || "Okänd", handelse: "Klarmarkerad" }],
+            }
+          : x
+      ),
+    });
+    notify(`${monthLabel(r.month)} klarmarkerad — kan nu skickas och laddas ner`);
+  };
+
+  const unlockKlar = (r, reason) => {
+    setState({
+      ...state,
+      utilityReports: state.utilityReports.map((x) =>
+        x.id === r.id
+          ? {
+              ...x,
+              klar: false,
+              klarAt: null,
+              klarAv: null,
+              laslogg: [
+                ...(x.laslogg || []),
+                { datum: todayISO(), av: actor || "Okänd", handelse: "Upplåst", kommentar: (reason || "").trim() },
+              ],
+            }
+          : x
+      ),
+    });
+    setUnlockingId(null);
+    setUnlockReason("");
+    notify(`${monthLabel(r.month)} upplåst för justering — upplåsningen har loggats`);
+  };
+
+  // Upplåsning kräver en orsak (visas i loggen). unlockingId styr vilket kort
+  // som visar orsaksfältet just nu.
+  const [unlockingId, setUnlockingId] = useState(null);
+  const [unlockReason, setUnlockReason] = useState("");
+
+  // Radering av en enskild driftrapport (t.ex. felaktigt inmatade testvärden).
+  // Klarmarkerade rapporter måste låsas upp först — annars kan en styrelse-
+  // rapporterad månad försvinna spårlöst.
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+  const removeReport = (r) => {
+    if (r.klar) {
+      notify("Rapporten är klarmarkerad — lås upp den först innan den kan raderas");
+      return;
+    }
+    setState({
+      ...state,
+      utilityReports: state.utilityReports.filter((x) => x.id !== r.id),
+    });
+    notify(`${monthLabel(r.month)} raderad`);
+    setConfirmDeleteId(null);
+  };
+
+  // Export och utskick kräver att den senaste månadens rapport är klarmarkerad
+  // — annars riskerar styrelsen att få ett halvfärdigt utkast.
+  const requireLatestKlar = () => {
+    const latest = reports[0];
+    if (!latest) {
+      notify("Ingen driftrapport registrerad ännu");
+      return false;
+    }
+    if (!latest.klar) {
+      notify(`Klarmarkera ${monthLabel(latest.month)} innan rapporten kan skickas eller laddas ner`);
+      return false;
+    }
+    return true;
+  };
+
+  // PDF:en byggs per fastighet. Omfattar urvalet flera hus skapas rapporten
+  // för det första huset — sammanställningen för hela föreningen visas i vyn.
+  const buildPdfForCurrentProperty = () => buildDriftrapportPdf(reports, org, allReports, state);
+
+  const downloadPdf = () => {
+    if (scopedProps.length !== 1) {
+      notify("Välj en specifik förening högst upp för att ladda ner PDF-rapport");
+      return;
+    }
+    if (!requireLatestKlar()) return;
+    const doc = buildPdfForCurrentProperty();
+    doc.save(`driftrapport-${scopedProps[0].name.replace(/\s+/g, "-").toLowerCase()}.pdf`);
+  };
+
+  const downloadExcel = () => {
+    if (scopedProps.length !== 1) {
+      notify("Välj en specifik förening högst upp för att ladda ner Excel-fil");
+      return;
+    }
+    if (!requireLatestKlar()) return;
+    buildDriftrapportExcel(reports, org, allReports, state);
+  };
+
+  const emailPdf = async () => {
+    if (scopedProps.length === 0) {
+      notify("Välj en förening eller fastighet högst upp för att mejla rapporten");
+      return;
+    }
+    if (!org) {
+      notify("Fastigheten saknar förening — koppla den under Föreningar först");
+      return;
+    }
+    if (!mottagare) {
+      notify(`${org.name} saknar e-postadress — fyll i den under Föreningar`);
+      return;
+    }
+    if (!requireLatestKlar()) return;
+    setSendingEmail(true);
+    try {
+      const doc = buildPdfForCurrentProperty();
+      const pdfBase64 = doc.output("datauristring").split(",")[1];
+      const { data, error } = await supabase.functions.invoke("send-invoice-email", {
+        body: {
+          to: mottagare,
+          subject: `Driftrapport — ${org.name}`,
+          filename: `driftrapport-${org.name.replace(/\s+/g, "-").toLowerCase()}.pdf`,
+          pdfBase64,
+        },
+      });
+      if (error || data?.error) throw new Error(error?.message || data?.error || "Okänt fel");
+      // Bakspårning: logga utskicket så det alltid går att se när föreningen
+      // senast fick sin driftrapport (visas ovanför listan och i rapportloggen).
+      setState({
+        ...state,
+        rapportlogg: [
+          ...(state.rapportlogg || []),
+          {
+            id: uid(),
+            orgId: org.id,
+            mottagare,
+            typ: "Driftrapport (PDF via e-post)",
+            period: reports[0] ? monthLabel(reports[0].month) : "",
+            datum: todayISO(),
+            av: actor || "Okänd",
+          },
+        ],
+      });
+      notify("Driftrapport skickad via e-post");
+    } catch (err) {
+      console.error("Kunde inte skicka driftrapport:", err);
+      notify("Kunde inte skicka e-post — kontrollera serverfunktionen och försök igen");
+    } finally {
+      setSendingEmail(false);
+    }
+  };
+
+  return (
+    <div style={{ animation: "fk-rise .25s ease" }}>
+      <div style={S.sectionHead}>
+        <h2 style={S.h2}>Driftrapporter</h2>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <button style={S.secondaryBtn} className="fk-btn" onClick={downloadExcel}>
+            Ladda ner Excel
+          </button>
+          <button style={S.secondaryBtn} className="fk-btn" onClick={downloadPdf}>
+            Ladda ner PDF
+          </button>
+          <button style={S.secondaryBtn} className="fk-btn" onClick={emailPdf} disabled={sendingEmail}>
+            {sendingEmail ? "Skickar…" : "Skicka via e-post"}
+          </button>
+          <button
+            style={showForm ? S.secondaryBtn : S.addBtn}
+            className="fk-btn"
+            onClick={() => {
+              if (showForm) {
+                setShowForm(false);
+                setEditingId(null);
+              } else {
+                setShowForm(true);
+              }
+            }}
+          >
+            {showForm ? "Avbryt" : "+ Skapa ny driftrapport"}
+          </button>
+        </div>
+      </div>
+
+      {(scopedProps.length !== 1) && (
+        <div style={{ ...S.rowSub, marginBottom: 14 }}>
+          Export/mejl kräver att en specifik förening är vald högst upp — annars blandas flera föreningars siffror ihop.
+        </div>
+      )}
+
+      {org && reports.length < 2 && (
+        <div style={{ ...S.rowSub, marginBottom: 14 }}>
+          Diagrammen i PDF-rapporten visar förbrukning — mellanskillnaden mellan två månaders mätarställning.
+          Lägg till minst två månaders rapporter för den här föreningen innan diagrammen har något att visa.
+        </div>
+      )}
+
+      {/* Bakspårning: rapporthistoriken hör till FÖRENINGEN, så frågan "när fick
+          BRF Solrosen senast en rapport?" går att besvara oavsett om utskicket
+          gällde ett enskilt hus eller hela beståndet. */}
+      {org && (
+        <div style={{ ...S.rowSub, marginBottom: 10 }}>
+          {(() => {
+            const senast = (state.rapportlogg || [])
+              .filter((l) => l.orgId === org.id)
+              .sort((a, b) => (a.datum < b.datum ? 1 : -1))[0];
+            if (!senast) return `Ingen rapport har skickats till ${org.name} ännu.`;
+            return `Senast skickad rapport till ${org.name}: ${fmtDate(senast.datum)} (${senast.typ}${
+              senast.omfattning ? `, ${senast.omfattning}` : ""
+            }${senast.av ? `, av ${senast.av}` : ""}).`;
+          })()}
+        </div>
+      )}
+
+      {/* Graddagarpanelen (normalår + faktiska graddagar per månad) och
+          effektanalysen är inkopplade igen — normalårskorrigeringen och Q/W
+          bygger på graddagarna. Flerårsöversikten (FlerarsMatris) finns kvar
+          i filen och kan kopplas in på samma sätt när du vill ha den. */}
+      {org && <GraddagarPanel state={state} setState={setState} org={org} notify={notify} />}
+      {org && <DriftAnalys state={state} allReports={allReports} org={org} />}
+
+      {showForm && (
+        <UtilityReportForm
+          key={editingId || "ny"}
+          org={org}
+          initial={editingReport}
+          allReports={allReports}
+          onSubmit={saveReport}
+          onCancel={() => {
+            setShowForm(false);
+            setEditingId(null);
+          }}
+        />
+      )}
+
+      {reports.length === 0 ? (
+        <EmptyNote text="Inga driftrapporter registrerade ännu. Fyll i mätarställningen för vatten och el en gång i månaden — förbrukningen räknas ut automatiskt." />
+      ) : (
+        <div style={S.checklistStack}>
+          {reports.map((r) => {
+            const waterCons = metersTotalConsumption(allReports, r, "waterMeters");
+            const elCons = metersTotalConsumption(allReports, r, "elMeters");
+            const waterTot = metersTotalValue(r, "waterMeters");
+            const elTot = metersTotalValue(r, "elMeters");
+            return (
+              <div
+                key={r.id}
+                style={{
+                  ...S.checklistCard,
+                  ...(r.klar ? { background: "#EAF3EA", borderColor: "#2B6E5E" } : {}),
+                }}
+              >
+                <div style={S.checklistHead}>
+                  <div>
+                    <div style={S.taskCardTitle}>
+                      {monthLabel(r.month)}
+                      {showPropertyTag && <span style={S.propertyTag}>{propName(r.propertyId)}</span>}
+                      {r.klar && (
+                        <span style={{ marginLeft: 8, fontSize: 12, fontWeight: 600, color: "#2B6E5E" }}>
+                          ✓ Klarmarkerad{r.klarAt ? ` ${fmtDate(r.klarAt)}` : ""}{r.klarAv ? ` av ${r.klarAv}` : ""}
+                        </span>
+                      )}
+                      {!r.klar && (
+                        <span style={{ marginLeft: 8, fontSize: 12, fontWeight: 600, color: "#8a8578" }}>
+                          Utkast
+                        </span>
+                      )}
+                    </div>
+                    <div style={{ ...S.rowSub, marginTop: 4 }}>
+                      {waterTot != null && (
+                        <><strong>Vatten:</strong> {waterTot} m³{(r.waterMeters || []).length > 1 ? ` (${r.waterMeters.length} mätare)` : ""}{waterCons != null ? ` · ${waterCons >= 0 ? "+" : ""}${waterCons} m³ sedan förra mån.` : ""}<br /></>
+                      )}
+                      {elTot != null && (
+                        <><strong>El:</strong> {elTot} kWh{(r.elMeters || []).length > 1 ? ` (${r.elMeters.length} mätare)` : ""}{elCons != null ? ` · ${elCons >= 0 ? "+" : ""}${elCons} kWh sedan förra mån.` : ""}<br /></>
+                      )}
+                      {dhEffective(allReports, r) != null && (() => {
+                        const k = dhKpis(state, allReports, org, r);
+                        if (!k) return null;
+                        const parts = [`${fmtNum(k.mwh)} MWh`];
+                        if (k.m3 != null) parts.push(`${fmtNum(k.m3, 0)} m³`);
+                        if (k.qw != null) parts.push(`Q/W ${fmtNum(k.qw)}`);
+                        return <><strong>Fjärrvärme:</strong> {parts.join(" · ")}</>;
+                      })()}
+                    </div>
+                    {(r.dhFramledn != null || r.dhReturledn != null || r.dhUtetemp != null || r.radFramledn != null || r.tappvattenTemp != null || r.expansionTryck) && (
+                      <div style={{ ...S.rowSub, marginTop: 4 }}>
+                        <strong>Undercentral:</strong>{" "}
+                        {[
+                          r.dhMeterNr && `mätarnr ${r.dhMeterNr}`,
+                          r.dhFramledn != null && `framledn. ${r.dhFramledn}°`,
+                          r.dhReturledn != null && `returledn. ${r.dhReturledn}°`,
+                          r.dhUtetemp != null && `utetemp ${r.dhUtetemp}°`,
+                          (r.radFramledn != null || r.radReturledn != null) && `radiatorkrets ${r.radFramledn ?? "—"}°/${r.radReturledn ?? "—"}°`,
+                          r.tappvattenTemp != null && `tappvatten ${r.tappvattenTemp}°`,
+                          r.expansionTryck && `expansionskärl ${r.expansionTryck}`,
+                        ].filter(Boolean).join(" · ")}
+                        {r.paafyllt && <><br />Påfyllt: {r.paafyllt}</>}
+                      </div>
+                    )}
+                    {r.utfort && <div style={{ ...S.rowSub, marginTop: 4 }}>Utfört: {r.utfort}</div>}
+                    {r.atgard && <div style={{ ...S.rowSub, marginTop: 4 }}>Rekommenderad åtgärd: {r.atgard}</div>}
+                    {r.note && <div style={{ ...S.rowSub, marginTop: 4 }}>{r.note}</div>}
+                    <div style={{ ...S.rowSub, marginTop: 4 }}>Registrerad av {r.recordedBy}</div>
+                  </div>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-start" }}>
+                    {r.klar ? (
+                      <button style={S.secondaryBtnSmall || S.secondaryBtn} className="fk-btn" onClick={() => { setUnlockingId(r.id); setUnlockReason(""); }}>
+                        Lås upp
+                      </button>
+                    ) : (
+                      <button
+                        style={{ ...S.stampBtn, background: "#2B6E5E" }}
+                        className="fk-btn"
+                        onClick={() => markKlar(r)}
+                      >
+                        Klarmarkera
+                      </button>
+                    )}
+                    {!r.klar && (
+                      confirmDeleteId === r.id ? (
+                        <button
+                          style={{ ...S.stampBtn, background: "#C4171C" }}
+                          className="fk-btn"
+                          onClick={() => removeReport(r)}
+                        >
+                          Bekräfta radering
+                        </button>
+                      ) : (
+                        <button style={S.miniDelete} onClick={() => setConfirmDeleteId(r.id)} aria-label="Radera driftrapport">×</button>
+                      )
+                    )}
+                  </div>
+                </div>
+
+                {unlockingId === r.id && (
+                  <div style={{ marginTop: 10, padding: "10px 12px", border: "1px solid #C9C4B7", borderRadius: 8 }}>
+                    <div style={{ ...S.rowSub, marginBottom: 6 }}>
+                      Ange varför rapporten låses upp — det sparas i loggen tillsammans med vem och när.
+                    </div>
+                    <input
+                      className="fk-input"
+                      style={S.input}
+                      value={unlockReason}
+                      onChange={(e) => setUnlockReason(e.target.value)}
+                      placeholder="t.ex. Justering av felavläst mätarställning"
+                      autoFocus
+                    />
+                    <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+                      <button
+                        style={{ ...S.stampBtn, background: "#2B6E5E", opacity: unlockReason.trim() ? 1 : 0.5 }}
+                        className="fk-btn"
+                        disabled={!unlockReason.trim()}
+                        onClick={() => unlockKlar(r, unlockReason)}
+                      >
+                        Bekräfta upplåsning
+                      </button>
+                      <button style={S.linkBtn} className="fk-btn" onClick={() => { setUnlockingId(null); setUnlockReason(""); }}>
+                        Avbryt
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {(r.laslogg || []).length > 0 && (
+                  <div style={{ ...S.rowSub, marginTop: 6, fontSize: 12 }}>
+                    <div style={{ fontWeight: 600, marginBottom: 2 }}>Logg</div>
+                    {(r.laslogg || []).map((l, i) => (
+                      <div key={i} style={{ marginBottom: 2 }}>
+                        {l.handelse} {fmtDate(l.datum)} av {l.av}
+                        {l.kommentar ? <span style={{ color: "#B07A16" }}> — {l.kommentar}</span> : null}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {!r.klar && (
+                  <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 10 }}>
+                    <button style={S.stampBtn} className="fk-btn" onClick={() => startEdit(r)}>
+                      Redigera
+                    </button>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {(() => {
+        const logg = (state.rapportlogg || [])
+          .filter((l) => org && l.orgId === org.id)
+          .sort((a, b) => (a.datum < b.datum ? 1 : -1));
+        if (logg.length === 0) return null;
+        return (
+          <div style={{ marginTop: 20 }}>
+            <div style={{ ...S.taskCardTitle, marginBottom: 6 }}>Rapportlogg — skickade rapporter</div>
+            <div style={{ overflowX: "auto" }}>
+              <table style={{ borderCollapse: "collapse", fontSize: 13, width: "100%" }}>
+                <thead>
+                  <tr style={{ textAlign: "left", color: "#5C594E" }}>
+                    <th style={{ padding: "4px 10px 4px 0" }}>Datum</th>
+                    {showPropertyTag && <th style={{ padding: "4px 10px" }}>Förening</th>}
+                    <th style={{ padding: "4px 10px" }}>Typ</th>
+                    <th style={{ padding: "4px 10px" }}>Skickad av</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {logg.map((l) => (
+                    <tr key={l.id} style={{ borderTop: "1px solid #C9C4B7" }}>
+                      <td style={{ padding: "4px 10px 4px 0", whiteSpace: "nowrap" }}>{fmtDate(l.datum)}</td>
+                      {showPropertyTag && <td style={{ padding: "4px 10px" }}>{propName(l.propertyId)}</td>}
+                      <td style={{ padding: "4px 10px" }}>{l.typ}</td>
+                      <td style={{ padding: "4px 10px" }}>{l.av || "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        );
+      })()}
+    </div>
+  );
+}
+
+// Inramat avsnitt i driftrapportformuläret. Rubriken ligger till vänster med
+// en färgmarkör, i samma stil som panelerna i föreningskortet.
+function FormSection({ color, title, subtitle, children }) {
+  return (
+    <div style={S.formSectionBox}>
+      <div style={S.formSectionHead}>
+        {color && <span style={{ width: 11, height: 11, background: color, display: "inline-block", borderRadius: 3, flexShrink: 0 }} />}
+        <h3 style={S.formSectionTitle}>{title}</h3>
+      </div>
+      {subtitle && <div style={{ ...S.rowSub, margin: 0 }}>{subtitle}</div>}
+      {children}
+    </div>
+  );
+}
+
+// Delavsnitt inuti en sektion (t.ex. radiatorkrets inne i undercentralen).
+function FormSubBox({ title, children }) {
+  return (
+    <div style={S.formSubBox}>
+      <div style={S.formSubTitle}>{title}</div>
+      {children}
+    </div>
+  );
+}
+
+function UtilityReportForm({ org, initial, allReports, onSubmit, onCancel }) {
+  // Vid NY rapport förifylls ingen månad — man väljer aktivt vilken månad
+  // som ska rapporteras. Vid redigering visas förstås rapportens månad.
+  const [month, setMonth] = useState(initial?.month || "");
+
+  // Förslag: nästa månad som saknas för vald förening (dock aldrig framtida).
+  const nextMonthOf = (ym) => {
+    const [yy, mm] = ym.split("-").map(Number);
+    return mm === 12 ? `${yy + 1}-01` : `${yy}-${String(mm + 1).padStart(2, "0")}`;
+  };
+  const reported = (allReports || [])
+    .filter((r) => r.orgId === org?.id)
+    .map((r) => r.month)
+    .sort();
+  const candidate = reported.length ? nextMonthOf(reported[reported.length - 1]) : thisMonthISO();
+  const suggestion = candidate <= thisMonthISO() ? candidate : null;
+
+  // Månad får skrivas fritt (t.ex. 202608) och formateras löpande till ÅÅÅÅ-MM.
+  const formatMonth = (raw) => {
+    const d = (raw || "").replace(/\D/g, "").slice(0, 6);
+    return d.length <= 4 ? d : `${d.slice(0, 4)}-${d.slice(4)}`;
+  };
+  const padMonth = (v) => {
+    const m = /^(\d{4})-(\d{1,2})$/.exec(v || "");
+    return m ? `${m[1]}-${m[2].padStart(2, "0")}` : v || "";
+  };
+  const monthComplete = /^\d{4}-(0[1-9]|1[0-2])$/.test(month);
+  // Vatten- och elmätare som listor — en förening kan ha flera. Senaste
+  // rapporten (samma förening) för att kunna ärva mätarnumren till en ny månad.
+  const latestPrev = useMemo(
+    () =>
+      (allReports || [])
+        .filter((r) => r.orgId === org?.id && (!initial || r.id !== initial.id))
+        .sort((a, b) => (a.month < b.month ? 1 : -1))[0] || null,
+    [allReports, org, initial]
+  );
+
+  // Vid REDIGERING: rapportens egna mätare. Vid NY rapport: ärv mätarnumren
+  // från förra månaden med tom ställning att fylla i (samma mätare varje
+  // månad). Finns ingen tidigare rapport börjar vi med en tom rad.
+  const seedMeters = (kind) => {
+    if (initial && Array.isArray(initial[kind]) && initial[kind].length) {
+      return initial[kind].map((m) => ({ id: m.id || uid(), nr: m.nr || "", value: m.value ?? "" }));
+    }
+    if (!initial && latestPrev && Array.isArray(latestPrev[kind]) && latestPrev[kind].length) {
+      return latestPrev[kind].map((m) => ({ id: uid(), nr: m.nr || "", value: "" }));
+    }
+    return [{ id: uid(), nr: "", value: "" }];
+  };
+
+  const [waterMeters, setWaterMeters] = useState(() => seedMeters("waterMeters"));
+  const [elMeters, setElMeters] = useState(() => seedMeters("elMeters"));
+
+  const updateMeter = (setter) => (id, key, val) =>
+    setter((list) => list.map((m) => (m.id === id ? { ...m, [key]: val } : m)));
+  const addMeter = (setter) => () =>
+    setter((list) => [...list, { id: uid(), nr: "", value: "" }]);
+  const removeMeter = (setter) => (id) =>
+    setter((list) =>
+      list.length > 1
+        ? list.filter((m) => m.id !== id)
+        : list.map((m) => (m.id === id ? { id: uid(), nr: "", value: "" } : m))
+    );
+
+  // Löpande summa av mätarställningarna (Summa-raden), som i mallen.
+  const metersSum = (list) => {
+    const vals = list.map((m) => m.value).filter((v) => v !== "" && v != null).map(Number);
+    return vals.length ? Math.round(vals.reduce((a, v) => a + v, 0) * 100) / 100 : null;
+  };
+  const [dhMeterNr, setDhMeterNr] = useState(initial?.dhMeterNr || "");
+  const [dhMeterMwh, setDhMeterMwh] = useState(initial?.dhMeterMwh ?? "");
+  const [dhMeterM3, setDhMeterM3] = useState(initial?.dhMeterM3 ?? "");
+  const [dhFramledn, setDhFramledn] = useState(initial?.dhFramledn ?? "");
+  const [dhReturledn, setDhReturledn] = useState(initial?.dhReturledn ?? "");
+  const [dhUtetemp, setDhUtetemp] = useState(initial?.dhUtetemp ?? "");
+  const [dhKl, setDhKl] = useState(initial?.dhKl || "");
+  const [radFramledn, setRadFramledn] = useState(initial?.radFramledn ?? "");
+  const [radReturledn, setRadReturledn] = useState(initial?.radReturledn ?? "");
+  const [tappvattenTemp, setTappvattenTemp] = useState(initial?.tappvattenTemp ?? "");
+  const [expansionTryck, setExpansionTryck] = useState(initial?.expansionTryck || "");
+  const [paafyllt, setPaafyllt] = useState(initial?.paafyllt || "");
+  const [utfort, setUtfort] = useState(initial?.utfort || "");
+  const [atgard, setAtgard] = useState(initial?.atgard || "");
+  const [note, setNote] = useState(initial?.note || "");
+
+  // Tidigare använda mätarnummer för just den här föreningen, per mätartyp —
+  // visas som förslag så man slipper skriva om samma nummer varje månad,
+  // men kan fortfarande skriva ett nytt (t.ex. vid mätarbyte).
+  const priorMeterNrs = (kind) => {
+    const values = (allReports || [])
+      .filter((r) => r.orgId === org?.id && Array.isArray(r[kind]))
+      .flatMap((r) => r[kind].map((m) => m.nr).filter(Boolean));
+    return [...new Set(values)];
+  };
+  const waterOptions = priorMeterNrs("waterMeters");
+  const elOptions = priorMeterNrs("elMeters");
+
+  const cleanMeters = (list) =>
+    list
+      .map((m) => ({
+        id: m.id,
+        nr: (m.nr || "").toString().trim(),
+        value: m.value === "" || m.value == null ? null : Number(m.value),
+      }))
+      .filter((m) => m.nr !== "" || m.value != null);
+
+  const submit = (e) => {
+    e.preventDefault();
+    if (!org || !month) return;
+    // Ofullständigt eller ogiltigt månadsformat (kräver ÅÅÅÅ-MM, 01–12).
+    if (!monthComplete) return;
+    // Framtida månader kan inte rapporteras — det finns inga avlästa värden
+    // för en månad som inte inträffat ännu.
+    if (month > thisMonthISO()) return;
+    onSubmit({
+      orgId: org.id,
+      month,
+      waterMeters: cleanMeters(waterMeters),
+      elMeters: cleanMeters(elMeters),
+      dhMeterNr: dhMeterNr.trim(),
+      dhMeterMwh: dhMeterMwh === "" ? null : Number(dhMeterMwh),
+      dhMeterM3: dhMeterM3 === "" ? null : Number(dhMeterM3),
+      dhFramledn: dhFramledn === "" ? null : Number(dhFramledn),
+      dhReturledn: dhReturledn === "" ? null : Number(dhReturledn),
+      dhUtetemp: dhUtetemp === "" ? null : Number(dhUtetemp),
+      dhKl: dhKl.trim(),
+      radFramledn: radFramledn === "" ? null : Number(radFramledn),
+      radReturledn: radReturledn === "" ? null : Number(radReturledn),
+      tappvattenTemp: tappvattenTemp === "" ? null : Number(tappvattenTemp),
+      expansionTryck: expansionTryck.trim(),
+      paafyllt: paafyllt.trim(),
+      utfort: utfort.trim(),
+      atgard: atgard.trim(),
+      note: note.trim(),
+    });
+  };
+
+  return (
+    <form onSubmit={submit} style={S.formStack}>
+      <FormSection title="Månad" subtitle="Skriv årtal och månad, t.ex. 202608 — det formateras automatiskt till 2026-08.">
+        <div style={S.formRow}>
+          <label style={S.label}>
+            <span>Rapportmånad</span>
+            <input
+              className="fk-input"
+              style={S.input}
+              type="text"
+              inputMode="numeric"
+              value={month}
+              onChange={(e) => setMonth(formatMonth(e.target.value))}
+              onBlur={() => setMonth(padMonth(month))}
+              placeholder="ÅÅÅÅMM, t.ex. 202608"
+              required
+            />
+            {month && !monthComplete && (
+              <span style={{ color: "#C4171C", fontSize: 12, marginTop: 4 }}>
+                Ange år och månad som ÅÅÅÅ-MM (månad 01–12), t.ex. 2026-08.
+              </span>
+            )}
+            {monthComplete && month > thisMonthISO() && (
+              <span style={{ color: "#C4171C", fontSize: 12, marginTop: 4 }}>
+                Månaden ligger i framtiden — det går bara att rapportera till och med innevarande månad.
+              </span>
+            )}
+            {!initial && !month && (
+              <span style={{ fontSize: 12, color: "#5C594E", marginTop: 4, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                {suggestion ? (
+                  <>
+                    Nästa månad som saknas: <strong>{monthLabel(suggestion)}</strong>
+                    <button type="button" style={S.secondaryBtnSmall || S.secondaryBtn} className="fk-btn" onClick={() => setMonth(suggestion)}>
+                      Välj
+                    </button>
+                  </>
+                ) : (
+                  "Alla månader till och med innevarande är redan rapporterade för föreningen."
+                )}
+              </span>
+            )}
+          </label>
+        </div>
+      </FormSection>
+
+      <FormSection
+        color="#2B6E94"
+        title="Vattenförbrukning"
+        subtitle="En rad per vattenmätare (t.ex. Övre och Undre). Mätarnumren följer med till nästa månad — då fyller du bara i den nya ställningen."
+      >
+        {waterMeters.map((m, i) => (
+          <div key={m.id} style={S.formRow}>
+            <label style={S.label}>
+              Mätarnummer{waterMeters.length > 1 ? ` ${i + 1}` : ""} (valfritt)
+              <input
+                className="fk-input"
+                style={S.input}
+                value={m.nr}
+                onChange={(e) => updateMeter(setWaterMeters)(m.id, "nr", e.target.value)}
+                list="water-meter-options"
+                placeholder={waterOptions.length ? "Välj tidigare, eller skriv nytt" : ""}
+              />
+            </label>
+            <label style={S.label}>
+              Mätarställning (m³)
+              <input className="fk-input" style={S.input} type="number" step="0.01" min="0" value={m.value} onChange={(e) => updateMeter(setWaterMeters)(m.id, "value", e.target.value)} />
+            </label>
+            <button type="button" onClick={() => removeMeter(setWaterMeters)(m.id)} className="fk-btn" style={{ ...S.linkBtn, color: "#C4171C", alignSelf: "flex-end", paddingBottom: 12 }}>Ta bort</button>
+          </div>
+        ))}
+        <datalist id="water-meter-options">
+          {waterOptions.map((v) => <option key={v} value={v} />)}
+        </datalist>
+        <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+          <button type="button" onClick={addMeter(setWaterMeters)} className="fk-btn" style={{ ...S.secondaryBtnSmall, color: "#2B6E5E", borderColor: "#2B6E5E" }}>+ Lägg till vattenmätare</button>
+          {waterMeters.length > 1 && metersSum(waterMeters) != null && (
+            <span style={{ ...S.rowSub, margin: 0 }}>Summa ställning: <strong>{metersSum(waterMeters)} m³</strong></span>
+          )}
+        </div>
+      </FormSection>
+
+      <FormSection
+        color="#C49A2A"
+        title="Elförbrukning"
+        subtitle="En rad per elmätare. Vid mätarbyte: lägg till en rad för den nya mätaren och låt den gamla stå kvar med sin slutställning."
+      >
+        {elMeters.map((m, i) => (
+          <div key={m.id} style={S.formRow}>
+            <label style={S.label}>
+              Mätarnummer{elMeters.length > 1 ? ` ${i + 1}` : ""} (valfritt)
+              <input
+                className="fk-input"
+                style={S.input}
+                value={m.nr}
+                onChange={(e) => updateMeter(setElMeters)(m.id, "nr", e.target.value)}
+                list="el-meter-options"
+                placeholder={elOptions.length ? "Välj tidigare, eller skriv nytt" : ""}
+              />
+            </label>
+            <label style={S.label}>
+              Mätarställning (kWh)
+              <input className="fk-input" style={S.input} type="number" step="0.01" min="0" value={m.value} onChange={(e) => updateMeter(setElMeters)(m.id, "value", e.target.value)} />
+            </label>
+            <button type="button" onClick={() => removeMeter(setElMeters)(m.id)} className="fk-btn" style={{ ...S.linkBtn, color: "#C4171C", alignSelf: "flex-end", paddingBottom: 12 }}>Ta bort</button>
+          </div>
+        ))}
+        <datalist id="el-meter-options">
+          {elOptions.map((v) => <option key={v} value={v} />)}
+        </datalist>
+        <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+          <button type="button" onClick={addMeter(setElMeters)} className="fk-btn" style={{ ...S.secondaryBtnSmall, color: "#2B6E5E", borderColor: "#2B6E5E" }}>+ Lägg till elmätare</button>
+          {elMeters.length > 1 && metersSum(elMeters) != null && (
+            <span style={{ ...S.rowSub, margin: 0 }}>Summa ställning: <strong>{metersSum(elMeters)} kWh</strong></span>
+          )}
+        </div>
+      </FormSection>
+
+      <FormSection
+        color="#2B6E5E"
+        title="Undercentral — avläst på plats"
+        subtitle="Samma uppgifter som den handskrivna driftrapporten från fjärrvärmecentralen. Förbrukningen (MWh/m³) räknas ut automatiskt mot förra månadens mätarställning."
+      >
+        <FormSubBox title="Mätare">
+          <div style={S.formRow}>
+            <label style={S.label}>
+              Mätarnr
+              <input className="fk-input" style={S.input} value={dhMeterNr} onChange={(e) => setDhMeterNr(e.target.value)} placeholder="t.ex. 1695" />
+            </label>
+            <label style={S.label}>
+              Kl. (avläsningstid)
+              <input className="fk-input" style={S.input} value={dhKl} onChange={(e) => setDhKl(e.target.value)} placeholder="t.ex. 12:12" />
+            </label>
+            <label style={S.label}>
+              Mätarställning (MWh)
+              <input className="fk-input" style={S.input} type="number" step="0.001" value={dhMeterMwh} onChange={(e) => setDhMeterMwh(e.target.value)} />
+            </label>
+            <label style={S.label}>
+              Flöde, mätarställning (m³)
+              <input className="fk-input" style={S.input} type="number" step="0.01" value={dhMeterM3} onChange={(e) => setDhMeterM3(e.target.value)} />
+            </label>
+          </div>
+        </FormSubBox>
+
+        <FormSubBox title="Primärkrets (fjärrvärme in)">
+          <div style={S.formRow}>
+            <label style={S.label}>
+              Framledn.temp C°
+              <input className="fk-input" style={S.input} type="number" step="0.1" value={dhFramledn} onChange={(e) => setDhFramledn(e.target.value)} />
+            </label>
+            <label style={S.label}>
+              Returledn.temp C°
+              <input className="fk-input" style={S.input} type="number" step="0.1" value={dhReturledn} onChange={(e) => setDhReturledn(e.target.value)} />
+            </label>
+            <label style={S.label}>
+              Utetemp C°
+              <input className="fk-input" style={S.input} type="number" step="0.1" value={dhUtetemp} onChange={(e) => setDhUtetemp(e.target.value)} />
+            </label>
+          </div>
+        </FormSubBox>
+
+        <FormSubBox title="Radiatorkrets">
+          <div style={S.formRow}>
+            <label style={S.label}>
+              Framledn.temp C°
+              <input className="fk-input" style={S.input} type="number" step="0.1" value={radFramledn} onChange={(e) => setRadFramledn(e.target.value)} />
+            </label>
+            <label style={S.label}>
+              Returledn.temp C°
+              <input className="fk-input" style={S.input} type="number" step="0.1" value={radReturledn} onChange={(e) => setRadReturledn(e.target.value)} />
+            </label>
+          </div>
+        </FormSubBox>
+
+        <FormSubBox title="Tappvattenkrets & expansionskärl">
+          <div style={S.formRow}>
+            <label style={S.label}>
+              Tappvattenkrets — Temp C°
+              <input className="fk-input" style={S.input} type="number" step="0.1" value={tappvattenTemp} onChange={(e) => setTappvattenTemp(e.target.value)} />
+            </label>
+            <label style={S.label}>
+              Expansionskärl — Tryck
+              <input className="fk-input" style={S.input} value={expansionTryck} onChange={(e) => setExpansionTryck(e.target.value)} placeholder="t.ex. OK" />
+            </label>
+          </div>
+        </FormSubBox>
+
+        <FormSubBox title="Anmärkningar / påfyllt">
+          <label style={S.label}>
+            <span style={{ fontWeight: 500 }}>Valfritt</span>
+            <input className="fk-input" style={S.input} value={paafyllt} onChange={(e) => setPaafyllt(e.target.value)} placeholder="t.ex. 1 L i expansionskärl under månaden" />
+          </label>
+        </FormSubBox>
+      </FormSection>
+
+      <FormSection color="#1C2321" title="Till styrelserapporten">
+        <div style={S.formRow}>
+          <label style={S.label}>
+            Utfört under månaden (valfritt)
+            <input className="fk-input" style={S.input} value={utfort} onChange={(e) => setUtfort(e.target.value)} placeholder="t.ex. Filterbyte ventilation, kontroll av undercentral" />
+          </label>
+          <label style={S.label}>
+            Rekommenderad åtgärd (valfritt)
+            <input className="fk-input" style={S.input} value={atgard} onChange={(e) => setAtgard(e.target.value)} placeholder="t.ex. Kontrollera värmekurva vid nästa driftbesök" />
+          </label>
+        </div>
+        <label style={S.label}>
+          Kommentar (valfritt)
+          <input className="fk-input" style={S.input} value={note} onChange={(e) => setNote(e.target.value)} placeholder="t.ex. mätarbyte, ovanligt hög förbrukning pga renovering" />
+        </label>
+      </FormSection>
+
+      <button type="submit" style={S.addBtn} className="fk-btn">Spara driftrapport</button>
+    </form>
+  );
+}
+
+/* ------------------------------ driftrapport: pdf & excel ------------------------------ */
+
+function buildDriftrapportPdf(reports, org, allReports, state) {
+  const propertyName = org?.name || "";
+  const sorted = reports.slice().sort((a, b) => (a.month < b.month ? -1 : 1));
+  const doc = new jsPDF({ unit: "pt", format: "a4" });
+  const marginX = 48;
+  const pageWidth = 595;
+  const pageBottom = 800;
+  let y = 56;
+
+  const GREEN = [43, 110, 94];
+  const GOLD = [196, 154, 42];
+  const RED = [196, 23, 28];
+  const INK = [28, 35, 33];
+  const MUTED = [92, 89, 78];
+  const LINE = [201, 196, 183];
+
+  const ensureSpace = (needed) => {
+    if (y + needed > pageBottom) {
+      doc.addPage();
+      y = 50;
+    }
+  };
+
+  /* ---------- y-axel med jämna värden och stödlinjer ---------- */
+  // Väljer ett "snyggt" steg (1, 2, 2,5, 5, 10 × tiopotens) så att axeln får
+  // 4–5 jämna nivåer, och returnerar axelns maxvärde att skala staplarna mot.
+  const niceStep = (max) => {
+    const raw = (max || 1) / 4;
+    const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    for (const m of [1, 2, 2.5, 5, 10]) {
+      if (raw <= m * mag) return m * mag;
+    }
+    return 10 * mag;
+  };
+
+  const AXIS_W = 30; // vänstermarginal för axelvärdena
+
+  const drawYAxis = (chartX, chartTop, chartHeight, chartWidth, dataMax, unit) => {
+    const step = niceStep(dataMax);
+    const axisMax = Math.max(Math.ceil((dataMax || 1) / step) * step, step);
+    doc.setFontSize(7);
+    doc.setFont("helvetica", "normal");
+    for (let v = 0; v <= axisMax + step / 1000; v += step) {
+      const py = chartTop + chartHeight - (v / axisMax) * chartHeight;
+      doc.setDrawColor(...LINE);
+      doc.setLineWidth(v === 0 ? 0.8 : 0.35);
+      doc.line(chartX, py, chartX + chartWidth, py);
+      doc.setTextColor(...MUTED);
+      doc.text(fmtNum(v, step < 1 ? 1 : 0), chartX - 5, py + 2, { align: "right" });
+    }
+    doc.setTextColor(...MUTED);
+    doc.text(unit, chartX - 5, chartTop - 6, { align: "right" });
+    return axisMax;
+  };
+
+  // Höger y-axel (utan stödlinjer — vänsteraxeln står för rutnätet), används
+  // när en andra serie med annan skala ritas i samma diagram, t.ex. Q/W.
+  const drawYAxisRight = (chartX, chartTop, chartHeight, chartWidth, dataMax, unit, color) => {
+    const step = niceStep(dataMax);
+    const axisMax = Math.max(Math.ceil((dataMax || 1) / step) * step, step);
+    doc.setFontSize(7);
+    doc.setFont("helvetica", "normal");
+    doc.setTextColor(...(color || MUTED));
+    for (let v = 0; v <= axisMax + step / 1000; v += step) {
+      const py = chartTop + chartHeight - (v / axisMax) * chartHeight;
+      doc.text(fmtNum(v, step < 1 ? 1 : 0), chartX + chartWidth + 5, py + 2);
+    }
+    doc.text(unit, chartX + chartWidth + 5, chartTop - 6);
+    return axisMax;
+  };
+
+  /* ---------- sidhuvud ---------- */
+  const logoW = 110;
+  const logoH = logoW / N2_LOGO_ASPECT;
+  doc.addImage(N2_LOGO_BASE64, "PNG", marginX, y - 26, logoW, logoH);
+  doc.setTextColor(...INK);
+  doc.setFontSize(16);
+  doc.setFont("helvetica", "bold");
+  doc.text("Driftrapport", marginX + logoW + 16, y - 4);
+  doc.setFont("helvetica", "normal");
+  doc.setFontSize(9);
+  doc.setTextColor(...MUTED);
+  doc.text(propertyName, marginX + logoW + 16, y + 9);
+  doc.text(`Skapad ${fmtDate(todayISO())}`, marginX + logoW + 16, y + 20);
+  y += 44;
+  doc.setDrawColor(...LINE);
+  doc.line(marginX, y, pageWidth - marginX, y);
+  y += 26;
+
+  // Rapporter som har fjärrvärmedata (för fjärrvärmetabellen längre ner).
+  const dhRows = sorted.filter((r) => dhEffective(allReports, r) != null);
+
+  const sectionTitle = (text) => {
+    ensureSpace(30);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(12);
+    doc.setTextColor(...INK);
+    doc.text(text, marginX, y);
+    y += 18;
+  };
+
+  // Statusrad i stil med rapportmallen: färgad punkt + rubrik + rader.
+  const statusRow = (color, title, lines) => {
+    ensureSpace(18 + lines.length * 12 + 8);
+    doc.setFillColor(...color);
+    doc.circle(marginX + 4, y - 3, 4, "F");
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(10.5);
+    doc.setTextColor(...INK);
+    doc.text(title, marginX + 16, y);
+    y += 13;
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9.5);
+    doc.setTextColor(...MUTED);
+    lines.forEach((t) => {
+      const wrapped = doc.splitTextToSize(t, pageWidth - marginX * 2 - 16);
+      doc.text(wrapped, marginX + 16, y);
+      y += wrapped.length * 11;
+    });
+    y += 9;
+  };
+
+  const textBlock = (title, text) => {
+    if (!text) return;
+    ensureSpace(34);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(10.5);
+    doc.setTextColor(...INK);
+    doc.text(title, marginX, y);
+    y += 13;
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9.5);
+    doc.setTextColor(...MUTED);
+    const wrapped = doc.splitTextToSize(text, pageWidth - marginX * 2);
+    ensureSpace(wrapped.length * 11 + 8);
+    doc.text(wrapped, marginX, y);
+    y += wrapped.length * 11 + 10;
+  };
+
+  // Kort pedagogisk förklaring i kursiv, dämpad stil — hjälper styrelsen
+  // att förstå vad respektive del av rapporten faktiskt betyder.
+  const explain = (text) => {
+    doc.setFont("helvetica", "italic");
+    doc.setFontSize(8);
+    doc.setTextColor(...MUTED);
+    const wrapped = doc.splitTextToSize(text, pageWidth - marginX * 2);
+    ensureSpace(wrapped.length * 10 + 6);
+    doc.text(wrapped, marginX, y);
+    y += wrapped.length * 10 + 8;
+    doc.setFont("helvetica", "normal");
+  };
+
+  // Tydlig sektionsrubrik per medium (fjärrvärme/vatten/el/värme):
+  // färgmarkör + versal rubrik + förklarande underrad + linje över hela bredden.
+  const mediumHeader = (color, title, subtitle) => {
+    ensureSpace(46);
+    doc.setFillColor(...color);
+    doc.rect(marginX, y - 8, 9, 9, "F");
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(12);
+    doc.setTextColor(...INK);
+    doc.text(title.toUpperCase(), marginX + 16, y);
+    if (subtitle) {
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(8.5);
+      doc.setTextColor(...MUTED);
+      doc.text(subtitle, marginX + 16, y + 11);
+    }
+    y += subtitle ? 18 : 8;
+    doc.setDrawColor(...color);
+    doc.setLineWidth(1);
+    doc.line(marginX, y, pageWidth - marginX, y);
+    doc.setLineWidth(0.5);
+    y += 14;
+  };
+
+  /* ---------- underlag: fjärrvärme per månad (råa värden, ingen analys) ---------- */
+  if (dhRows.length > 0) {
+    sectionTitle("Fjärrvärme");
+    mediumHeader(GREEN, "Fjärrvärme", "energi och flöde per månad — beräknat från undercentralens mätarställning");
+
+    autoTable(doc, {
+      startY: y,
+      margin: { left: marginX, right: marginX },
+      head: [[
+        "Månad",
+        "MWh",
+        "m³",
+        "Q/W",
+      ]],
+      body: dhRows.map((r) => {
+        const k = dhKpis(state, allReports, org, r);
+        return [
+          monthLabel(r.month),
+          fmtNum(k.mwh),
+          k.m3 != null ? fmtNum(k.m3, 0) : "—",
+          k.qw != null ? fmtNum(k.qw) : "—",
+        ];
+      }),
+      styles: { font: "helvetica", fontSize: 8, textColor: INK, cellPadding: 5 },
+      headStyles: { fillColor: [255, 255, 255], textColor: MUTED, fontStyle: "bold", fontSize: 7.5, lineWidth: { bottom: 1 }, lineColor: INK },
+      theme: "plain",
+    });
+    y = doc.lastAutoTable.finalY + 12;
+
+    doc.setFontSize(8);
+    doc.setFont("helvetica", "normal");
+    doc.setTextColor(...MUTED);
+    doc.text(
+      "MWh/m³ är förbrukningen beräknad från undercentralens mätarställning. Q/W (m³ per MWh) är flödet i förhållande till energin den månaden.",
+      marginX,
+      y,
+      { maxWidth: pageWidth - marginX * 2 }
+    );
+    y += 26;
+  }
+
+  /* ---------- underlag: undercentralens driftvärden (den handskrivna blanketten) ---------- */
+  const ucRows = sorted.filter(
+    (r) =>
+      r.dhFramledn != null ||
+      r.dhReturledn != null ||
+      r.dhUtetemp != null ||
+      r.radFramledn != null ||
+      r.radReturledn != null ||
+      r.tappvattenTemp != null ||
+      r.expansionTryck ||
+      r.dhMeterMwh != null ||
+      r.dhMeterM3 != null
+  );
+  if (ucRows.length > 0) {
+    if (y + 140 > pageBottom) {
+      doc.addPage();
+      y = 56;
+    }
+    mediumHeader(GREEN, "Undercentral", "avläst på plats — temperaturer, tryck och mätarställning per månad");
+
+    autoTable(doc, {
+      startY: y,
+      margin: { left: marginX, right: marginX },
+      head: [[
+        "Månad",
+        "Mätarnr",
+        "Mätarst.\nMWh",
+        "Flöde\nm³",
+        "Framl.\n°C",
+        "Retur\n°C",
+        "Ute-\ntemp °C",
+        "Radiator\nframl/ret °C",
+        "Tapp-\nvatten °C",
+        "Expansions-\nkärl tryck",
+      ]],
+      body: ucRows.map((r) => [
+        monthLabel(r.month),
+        r.dhMeterNr || "—",
+        r.dhMeterMwh != null ? fmtNum(r.dhMeterMwh, 3) : "—",
+        r.dhMeterM3 != null ? fmtNum(r.dhMeterM3, 2) : "—",
+        r.dhFramledn != null ? fmtNum(r.dhFramledn) : "—",
+        r.dhReturledn != null ? fmtNum(r.dhReturledn) : "—",
+        r.dhUtetemp != null ? fmtNum(r.dhUtetemp) : "—",
+        `${r.radFramledn != null ? fmtNum(r.radFramledn) : "—"}/${r.radReturledn != null ? fmtNum(r.radReturledn) : "—"}`,
+        r.tappvattenTemp != null ? fmtNum(r.tappvattenTemp) : "—",
+        r.expansionTryck || "—",
+      ]),
+      styles: { font: "helvetica", fontSize: 7.5, textColor: INK, cellPadding: 4 },
+      headStyles: { fillColor: [255, 255, 255], textColor: MUTED, fontStyle: "bold", fontSize: 6.8, lineWidth: { bottom: 1 }, lineColor: INK },
+      theme: "plain",
+    });
+    y = doc.lastAutoTable.finalY + 10;
+
+    const paafylltRows = ucRows.filter((r) => r.paafyllt);
+    if (paafylltRows.length > 0) {
+      doc.setFontSize(8);
+      doc.setFont("helvetica", "bold");
+      doc.setTextColor(...INK);
+      doc.text("Anmärkningar / påfyllt", marginX, y);
+      y += 12;
+      doc.setFont("helvetica", "normal");
+      doc.setTextColor(...MUTED);
+      paafylltRows.forEach((r) => {
+        ensureSpace(12);
+        doc.text(`${monthLabel(r.month)}: ${r.paafyllt}`, marginX, y);
+        y += 12;
+      });
+      y += 8;
+    } else {
+      y += 4;
+    }
+  }
+
+  /* ---------- underlag per medium: vatten, el, värme — egna sektioner ---------- */
+
+  // Enkla stapeldiagram över FÖRBRUKNING (inte mätarställning, som bara
+  // ökar månad för månad och inte skulle visa något meningsfullt mönster)
+  const drawBarChart = (title, valueFn, unit, startY) => {
+    if (startY + 130 > pageBottom) {
+      doc.addPage();
+      startY = 56;
+    }
+    doc.setFontSize(10);
+    doc.setFont("helvetica", "bold");
+    doc.setTextColor(...INK);
+    doc.text(title, marginX, startY);
+
+    const chartX = marginX + AXIS_W;
+    const chartTop = startY + 16;
+    const chartHeight = 90;
+    const chartWidth = pageWidth - marginX * 2 - AXIS_W;
+    const validPoints = sorted.map((r) => valueFn(r));
+    const nums = validPoints.filter((v) => v != null);
+
+    if (nums.length === 0) {
+      doc.setFontSize(9);
+      doc.setFont("helvetica", "normal");
+      doc.setTextColor(...MUTED);
+      doc.text(
+        "Ingen förbrukning att visa ännu — kräver minst två månaders mätarställningar att jämföra mellan.",
+        marginX,
+        chartTop + 20
+      );
+      return chartTop + 46;
+    }
+
+    const dataMax = Math.max(...nums.map((v) => Math.abs(v)), 1);
+    const axisMax = drawYAxis(chartX, chartTop, chartHeight, chartWidth, dataMax, unit);
+    const hasNegative = nums.some((v) => v < 0);
+    const barGap = 6;
+    const barWidth = Math.min(22, Math.max(6, chartWidth / Math.max(sorted.length, 1) - barGap));
+
+    sorted.forEach((r, i) => {
+      const val = validPoints[i];
+      if (val == null) return;
+      const barH = (Math.abs(val) / axisMax) * chartHeight;
+      const x = chartX + i * (barWidth + barGap);
+      if (val < 0) {
+        doc.setFillColor(...RED);
+      } else {
+        doc.setFillColor(...GREEN);
+      }
+      doc.rect(x, chartTop + chartHeight - barH, barWidth, barH, "F");
+    });
+
+    doc.setDrawColor(...GOLD);
+    doc.setFillColor(...GOLD);
+    doc.setLineWidth(1.1);
+    let prevPoint = null;
+    sorted.forEach((r, i) => {
+      const val = validPoints[i];
+      if (val == null) {
+        prevPoint = null;
+        return;
+      }
+      const barH = (Math.abs(val) / axisMax) * chartHeight;
+      const x = chartX + i * (barWidth + barGap) + barWidth / 2;
+      const py = chartTop + chartHeight - barH;
+      if (prevPoint) {
+        doc.line(prevPoint.x, prevPoint.y, x, py);
+      }
+      doc.circle(x, py, 1.6, "F");
+      prevPoint = { x, y: py };
+    });
+
+    // Förbrukningsvärdet utsatt ovanför varje stapel — så exakt förbrukning
+    // per månad (t.ex. m³ för vatten) kan läsas av direkt utan axeln.
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(sorted.length > 14 ? 5.5 : 6.5);
+    sorted.forEach((r, i) => {
+      const val = validPoints[i];
+      if (val == null) return;
+      const barH = (Math.abs(val) / axisMax) * chartHeight;
+      const x = chartX + i * (barWidth + barGap) + barWidth / 2;
+      doc.setTextColor(...(val < 0 ? RED : INK));
+      doc.text(fmtNum(val, Math.abs(val) < 10 ? 1 : 0), x, chartTop + chartHeight - barH - 5, { align: "center" });
+    });
+    doc.setFont("helvetica", "normal");
+
+    doc.setFontSize(7);
+    doc.setFont("helvetica", "normal");
+    doc.setTextColor(...MUTED);
+    const labelEvery = sorted.length > 8 ? Math.ceil(sorted.length / 8) : 1;
+    sorted.forEach((r, i) => {
+      if (i % labelEvery !== 0) return;
+      const x = chartX + i * (barWidth + barGap);
+      doc.text(r.month.slice(2).replace("-", "/"), x, chartTop + chartHeight + 12, { angle: 0, maxWidth: barWidth + barGap });
+    });
+
+    doc.setFontSize(8);
+    doc.setTextColor(...GOLD);
+    doc.text("— trend", chartX + chartWidth, chartTop - 6, { align: "right" });
+    doc.setTextColor(...MUTED);
+    if (hasNegative) {
+      doc.setTextColor(...RED);
+      doc.text("Röd stapel = mätarställningen minskade sedan förra månaden — kontrollera avläsningen", chartX, chartTop + chartHeight + 22);
+    }
+
+    return chartTop + chartHeight + (hasNegative ? 34 : 26);
+  };
+
+  // Linjediagram över FÖRBRUKNING per månad — visar förändringen över tiden
+  // tydligare än staplar när man vill läsa av trenden. Har en egen y-axel som
+  // klarar negativa värden (om en mätarställning råkat minska) med en tydlig
+  // nollinje.
+  const drawLineChart = (title, valueFn, unit, startY) => {
+    if (startY + 130 > pageBottom) {
+      doc.addPage();
+      startY = 56;
+    }
+    doc.setFontSize(10);
+    doc.setFont("helvetica", "bold");
+    doc.setTextColor(...INK);
+    doc.text(title, marginX, startY);
+
+    const chartX = marginX + AXIS_W;
+    const chartTop = startY + 16;
+    const chartHeight = 90;
+    const chartWidth = pageWidth - marginX * 2 - AXIS_W;
+    const points = sorted.map((r) => valueFn(r));
+    const nums = points.filter((v) => v != null);
+
+    if (nums.length === 0) {
+      doc.setFontSize(9);
+      doc.setFont("helvetica", "normal");
+      doc.setTextColor(...MUTED);
+      doc.text(
+        "Ingen förbrukning att visa ännu — kräver minst två månaders mätarställningar att jämföra mellan.",
+        marginX,
+        chartTop + 20
+      );
+      return chartTop + 46;
+    }
+
+    const dataMax = Math.max(...nums, 0);
+    const dataMin = Math.min(...nums, 0);
+    const step = niceStep(Math.max(dataMax - dataMin, Math.abs(dataMax), 1));
+    const axisMax = Math.max(Math.ceil(dataMax / step) * step, step);
+    const axisMin = dataMin < 0 ? Math.floor(dataMin / step) * step : 0;
+    const range = axisMax - axisMin || 1;
+    const yFor = (v) => chartTop + chartHeight - ((v - axisMin) / range) * chartHeight;
+
+    // Rutnät + axelvärden
+    doc.setFontSize(7);
+    doc.setFont("helvetica", "normal");
+    for (let v = axisMin; v <= axisMax + step / 1000; v += step) {
+      const py = yFor(v);
+      doc.setDrawColor(...LINE);
+      doc.setLineWidth(Math.abs(v) < step / 1000 ? 0.8 : 0.35);
+      doc.line(chartX, py, chartX + chartWidth, py);
+      doc.setTextColor(...MUTED);
+      doc.text(fmtNum(v, step < 1 ? 1 : 0), chartX - 5, py + 2, { align: "right" });
+    }
+    doc.setTextColor(...MUTED);
+    doc.text(unit, chartX - 5, chartTop - 6, { align: "right" });
+
+    // Punkternas x-läge (jämnt fördelade över bredden)
+    const n = sorted.length;
+    const xFor = (i) => (n === 1 ? chartX + chartWidth / 2 : chartX + (i / (n - 1)) * chartWidth);
+
+    // Linjen (bruten vid saknade månader)
+    doc.setDrawColor(...GOLD);
+    doc.setLineWidth(1.4);
+    let prev = null;
+    points.forEach((v, i) => {
+      if (v == null) { prev = null; return; }
+      const p = { x: xFor(i), y: yFor(v) };
+      if (prev) doc.line(prev.x, prev.y, p.x, p.y);
+      prev = p;
+    });
+
+    // Punkter + värden (enhetlig färg — ingen grön/röd markering för upp/ned)
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(n > 14 ? 5.5 : 6.5);
+    points.forEach((v, i) => {
+      if (v == null) return;
+      const x = xFor(i);
+      const py = yFor(v);
+      doc.setFillColor(...INK);
+      doc.circle(x, py, 1.9, "F");
+      doc.setTextColor(...INK);
+      doc.text(fmtNum(v, Math.abs(v) < 10 ? 1 : 0), x, py - 5, { align: "center" });
+    });
+    doc.setFont("helvetica", "normal");
+
+    // Månadsetiketter
+    doc.setFontSize(7);
+    doc.setTextColor(...MUTED);
+    const labelEvery = n > 8 ? Math.ceil(n / 8) : 1;
+    sorted.forEach((r, i) => {
+      if (i % labelEvery !== 0) return;
+      doc.text(r.month.slice(2).replace("-", "/"), xFor(i), chartTop + chartHeight + 12, { align: "center", maxWidth: 40 });
+    });
+
+    return chartTop + chartHeight + 26;
+  };
+
+  // En komplett sektion per medium: rubrik med färgmarkör, tabell med
+  // mätarställning + förbrukning, och förbrukningsdiagram — så att vatten,
+  // el och värme aldrig blandas ihop i rapporten.
+  const BLUE = [43, 110, 148];
+  const BROWN = [146, 94, 58];
+  const fmtVal = (v) => (v == null ? "—" : v);
+  const fmtCons = (v) => (v == null ? "—" : `${v >= 0 ? "+" : ""}${v}`);
+
+  const mediumBlock = (color, title, subtitle, kind, unit) => {
+    const rowsWithData = sorted.filter((r) => Array.isArray(r[kind]) && r[kind].some((m) => m.value != null));
+    if (rowsWithData.length === 0) return;
+    if (y + 140 > pageBottom) {
+      doc.addPage();
+      y = 56;
+    }
+    mediumHeader(color, title, subtitle);
+    y = drawLineChart("Förbrukning per månad", (r) => metersTotalConsumption(allReports, r, kind), unit, y) + 10;
+  };
+
+  mediumBlock(BLUE, "Vatten", "föreningens vattenmätare — avläst ställning och beräknad förbrukning", "waterMeters", "m³");
+  mediumBlock(GOLD, "El", "föreningens elmätare — avläst ställning och beräknad förbrukning", "elMeters", "kWh");
+
+  /* ---------- kommentarer & registreringar ---------- */
+  const rowsWithNotes = sorted.filter((r) => r.note || r.recordedBy || r.utfort || r.atgard);
+  if (rowsWithNotes.length > 0) {
+    if (y + 100 > pageBottom) {
+      doc.addPage();
+      y = 56;
+    }
+    sectionTitle("Kommentarer och registreringar");
+    autoTable(doc, {
+      startY: y,
+      margin: { left: marginX, right: marginX },
+      head: [["Månad", "Registrerad av", "Utfört / åtgärd / kommentar"]],
+      body: rowsWithNotes.map((r) => [
+        monthLabel(r.month),
+        `${r.recordedBy || "—"}${r.recordedAt ? ` (${fmtDate(r.recordedAt)})` : ""}`,
+        [
+          r.utfort && `Utfört: ${r.utfort}`,
+          r.atgard && `Rekommenderad åtgärd: ${r.atgard}`,
+          r.note,
+        ].filter(Boolean).join("\n"),
+      ]),
+      styles: { font: "helvetica", fontSize: 8, textColor: INK, cellPadding: 5 },
+      headStyles: { fillColor: [255, 255, 255], textColor: MUTED, fontStyle: "bold", fontSize: 7.5, lineWidth: { bottom: 1 }, lineColor: INK },
+      columnStyles: { 0: { cellWidth: 80 }, 1: { cellWidth: 110 }, 2: { cellWidth: "auto" } },
+      theme: "plain",
+    });
+    y = doc.lastAutoTable.finalY + 20;
+  }
+
+  return doc;
+}
+
+function buildDriftrapportExcel(reports, org, allReports, state) {
+  const propertyName = org?.name || "";
+  const sorted = reports.slice().sort((a, b) => (a.month < b.month ? -1 : 1));
+  const rows = sorted.map((r) => {
+    return {
+    Månad: monthLabel(r.month),
+    "Vattenmätare nr": (r.waterMeters || []).map((m) => m.nr).filter(Boolean).join(" / "),
+    "Vatten mätarställning (m³)": (r.waterMeters || []).map((m) => m.value).filter((v) => v != null).join(" / "),
+    "Vatten förbrukning (m³)": metersTotalConsumption(allReports, r, "waterMeters") ?? "",
+    "Elmätare nr": (r.elMeters || []).map((m) => m.nr).filter(Boolean).join(" / "),
+    "El mätarställning (kWh)": (r.elMeters || []).map((m) => m.value).filter((v) => v != null).join(" / "),
+    "El förbrukning (kWh)": metersTotalConsumption(allReports, r, "elMeters") ?? "",
+    "Fjärrvärme energi (MWh)": r.dhMwh ?? "",
+    "Fjärrvärme flöde (m³)": r.dhM3 ?? "",
+    "Fjärrvärme förbrukning (MWh)": (() => {
+      const eff = dhEffective(allReports, r);
+      return eff ? Math.round(eff.mwh * 1000) / 1000 : "";
+    })(),
+    "Fjärrvärme förbrukning (m³)": (() => {
+      const eff = dhEffective(allReports, r);
+      return eff && eff.m3 != null ? Math.round(eff.m3 * 100) / 100 : "";
+    })(),
+    "Undercentral mätarnr": r.dhMeterNr || "",
+    "Undercentral mätarställning (MWh)": r.dhMeterMwh ?? "",
+    "Undercentral flöde, mätarställning (m³)": r.dhMeterM3 ?? "",
+    "Kl. (avläsningstid)": r.dhKl || "",
+    "Framledn.temp C°": r.dhFramledn ?? "",
+    "Returledn.temp C°": r.dhReturledn ?? "",
+    "Utetemp C°": r.dhUtetemp ?? "",
+    "Radiatorkrets framledn.temp C°": r.radFramledn ?? "",
+    "Radiatorkrets returledn.temp C°": r.radReturledn ?? "",
+    "Tappvattenkrets temp C°": r.tappvattenTemp ?? "",
+    "Expansionskärl tryck": r.expansionTryck || "",
+    "Anmärkningar / påfyllt": r.paafyllt || "",
+    "Utfört under månaden": r.utfort || "",
+    "Rekommenderad åtgärd": r.atgard || "",
+    Kommentar: r.note || "",
+    "Registrerad av": r.recordedBy || "",
+  };
+  });
+
+  const worksheet = XLSX.utils.json_to_sheet(rows);
+  worksheet["!cols"] = [
+    { wch: 16 }, { wch: 14 }, { wch: 18 }, { wch: 16 },
+    { wch: 12 }, { wch: 16 }, { wch: 14 },
+    { wch: 14 }, { wch: 18 }, { wch: 16 },
+    { wch: 18 }, { wch: 16 }, { wch: 24 }, { wch: 24 },
+    { wch: 16 }, { wch: 20 }, { wch: 18 }, { wch: 12 },
+    { wch: 14 }, { wch: 14 }, { wch: 12 },
+    { wch: 20 }, { wch: 20 }, { wch: 16 }, { wch: 16 },
+    { wch: 30 },
+    { wch: 30 }, { wch: 30 }, { wch: 30 }, { wch: 18 },
+  ];
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, worksheet, "Driftrapport");
+  XLSX.writeFile(workbook, `driftrapport-${propertyName.replace(/\s+/g, "-").toLowerCase()}.xlsx`);
+}
+
+/* ------------------------------ kalender ------------------------------ */
 
 function Kalender({ state, scopedProps }) {
   const [monthOffset, setMonthOffset] = useState(0);
@@ -3828,6 +6714,17 @@ const S = {
   label: { display: "flex", flexDirection: "column", gap: 5, fontSize: 12.5, color: "#5C594E", fontWeight: 500 },
   input: { border: "1px solid #C9C4B7", borderRadius: 6, padding: "8px 10px", fontSize: 13.5, color: "#1C2321", background: "#FBFAF7" },
 
+  // Inramade avsnitt i driftrapportformuläret — samma vita box som panel/
+  // föreningskortet, med en tydlig rubrik till vänster.
+  formStack: { display: "flex", flexDirection: "column", gap: 14, marginBottom: 16 },
+  formSectionBox: { background: "#FFFFFF", border: "1px solid #C9C4B7", borderRadius: 8, padding: 16, display: "flex", flexDirection: "column", gap: 12 },
+  formSectionHead: { display: "flex", alignItems: "center", gap: 9 },
+  formSectionTitle: { fontFamily: "'Oswald', sans-serif", fontSize: 17, fontWeight: 600, margin: 0, color: "#1C2321", letterSpacing: 0.2 },
+  // Delavsnitt inuti en sektion (t.ex. radiatorkrets under undercentralen) —
+  // en ljus inramad box med en tydlig underrubrik.
+  formSubBox: { background: "#FBFAF7", border: "1px solid #E5E1D6", borderRadius: 6, padding: 12, display: "flex", flexDirection: "column", gap: 10 },
+  formSubTitle: { fontSize: 13, fontWeight: 700, color: "#3A413C", letterSpacing: 0.2 },
+
   cardGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(230px, 1fr))", gap: 12 },
   taskCard: { background: "#FFFFFF", border: "1.5px solid #C9C4B7", borderRadius: 8, padding: 14, display: "flex", flexDirection: "column", gap: 6 },
   taskCardTop: { display: "flex", justifyContent: "space-between", alignItems: "center" },
@@ -3953,6 +6850,13 @@ const S = {
   contactRole: { fontSize: 10.5, textTransform: "uppercase", letterSpacing: 0.5, color: "#5C594E", background: "#EDEAE1", padding: "2px 7px", borderRadius: 4, flexShrink: 0 },
   contactName: { fontWeight: 600, fontSize: 13 },
   contactFormRow: { display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" },
+
+  // Föreningsvyn: kort per förening med dess fastigheter under sig.
+  hint: { fontSize: 11.5, color: "#8a8578", marginTop: 4, fontWeight: 400, lineHeight: 1.45 },
+  orgCard: { background: "#FFFFFF", border: "1.5px solid #C9C4B7", borderRadius: 8, padding: 14, display: "flex", flexDirection: "column", gap: 10 },
+  orgCardHead: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, flexWrap: "wrap" },
+  orgCardName: { fontFamily: "'Oswald', sans-serif", fontSize: 15.5, fontWeight: 600 },
+  orgPropRow: { display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", fontSize: 13, background: "#F6F4EE", border: "1px solid #E0DCD1", borderRadius: 6, padding: "8px 10px" },
 
   entryRow: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", background: "#FFFFFF", border: "1px solid #C9C4B7", borderRadius: 8, padding: "10px 14px" },
   invoicedTag: { marginLeft: 8, fontSize: 10, textTransform: "uppercase", letterSpacing: 0.5, color: "#2B6E5E", border: "1px solid #2B6E5E", borderRadius: 4, padding: "1px 6px" },

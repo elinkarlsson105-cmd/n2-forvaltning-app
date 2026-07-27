@@ -1356,7 +1356,6 @@ function AuthenticatedApp({ session }) {
 
   const tabs = [
     { id: "oversikt", label: "Översikt" },
-    { id: "uppgifter", label: "Uppgifter" },
     { id: "checklistor", label: "Checklistor" },
     { id: "arenden", label: "Ärenden" },
     { id: "felanmalan", label: "Felanmälan" },
@@ -1442,15 +1441,6 @@ function AuthenticatedApp({ session }) {
                 setTab={setTab}
                 onEditOrg={() => setOrgModal({ editId: selectedOrg.id })}
                 onRemoveOrg={removeOrganization}
-              />
-            )}
-            {tab === "uppgifter" && (
-              <Uppgifter
-                state={state}
-                setState={setState}
-                scopedProps={scopedProps}
-                actor={actorName}
-                notify={notify}
               />
             )}
             {tab === "checklistor" && (
@@ -1919,13 +1909,32 @@ function OrganizationForm({ initial, onSubmit, onCancel }) {
 
 function Oversikt({ state, scopedProps, selectedProperty, selectedOrg, setTab, onEditOrg, onRemoveOrg }) {
   const ids = new Set(scopedProps.map((p) => p.id));
-  const tasks = state.tasks.filter((t) => ids.has(t.propertyId));
   const issues = state.issues.filter((i) => ids.has(i.propertyId));
   const orders = state.billableOrders || [];
   const today = todayISO();
 
-  const overdue = tasks.filter((t) => t.nextDue < today);
-  const dueSoon = tasks.filter((t) => t.nextDue >= today && daysBetween(today, t.nextDue) <= 7);
+  // Återkommande arbete hanteras nu enbart via checklistorna. "Att pricka av"
+  // = innevarande period ej bekräftad; "missad" = även föregående period ej
+  // bekräftad.
+  const checklistTemplates = state.checklistTemplates.filter((t) => ids.has(t.propertyId) && t.active !== false);
+  const runDone = (tmplId, period, interval) =>
+    state.checklistRuns.some(
+      (r) => r.templateId === tmplId && (r.period || periodKey(r.date, interval)) === period && r.done
+    );
+  const checklistStatus = checklistTemplates.map((t) => {
+    const interval = t.interval || "vecka";
+    const cur = periodKey(new Date(), interval);
+    const prev = recentPeriods(interval, 2)[0];
+    return {
+      template: t,
+      interval,
+      curKey: cur,
+      dueNow: !runDone(t.id, cur, interval),
+      missedPrev: prev !== cur && !runDone(t.id, prev, interval),
+    };
+  });
+  const dueNow = checklistStatus.filter((c) => c.dueNow);
+  const missed = checklistStatus.filter((c) => c.missedPrev);
   const openIssues = issues.filter((i) => i.status !== "Klar");
   const acuteIssues = openIssues.filter((i) => i.priority === "Akut");
   const openFelanmalan = orders.filter((o) => ids.has(o.propertyId) && o.type === "felanmalan" && o.status !== "Klar" && !o.cancelled);
@@ -2090,7 +2099,7 @@ function Oversikt({ state, scopedProps, selectedProperty, selectedOrg, setTab, o
                 <thead>
                   <tr>
                     <th style={S.summaryTh}>Förening</th>
-                    <th style={S.summaryTh}>Försenade</th>
+                    <th style={S.summaryTh}>Att pricka av</th>
                     <th style={S.summaryTh}>Öppna ärenden</th>
                     <th style={S.summaryTh}>Öppna felanmälningar</th>
                     <th style={S.summaryTh}>Öppna tilläggstjänster</th>
@@ -2098,15 +2107,14 @@ function Oversikt({ state, scopedProps, selectedProperty, selectedOrg, setTab, o
                 </thead>
                 <tbody>
                   {scopedProps.map((p) => {
-                    const pTasks = tasks.filter((t) => t.propertyId === p.id);
-                    const pOverdue = pTasks.filter((t) => t.nextDue < today).length;
+                    const pDue = checklistStatus.filter((c) => c.template.propertyId === p.id && c.dueNow).length;
                     const pOpenIssues = issues.filter((i) => i.propertyId === p.id && i.status !== "Klar").length;
                     const pOpenFelanmalan = openFelanmalan.filter((o) => o.propertyId === p.id).length;
                     const pOpenTillaggstjanst = openTillaggstjanst.filter((o) => o.propertyId === p.id).length;
                     return (
                       <tr key={p.id}>
                         <td style={S.summaryTd}>{p.name}</td>
-                        <td style={{ ...S.summaryTd, color: pOverdue ? "#C4171C" : "#5C594E" }}>{pOverdue}</td>
+                        <td style={{ ...S.summaryTd, color: pDue ? "#C4171C" : "#5C594E" }}>{pDue}</td>
                         <td style={{ ...S.summaryTd, color: pOpenIssues ? "#3A413C" : "#5C594E" }}>{pOpenIssues}</td>
                         <td style={{ ...S.summaryTd, color: pOpenFelanmalan ? "#3A413C" : "#5C594E" }}>{pOpenFelanmalan}</td>
                         <td style={{ ...S.summaryTd, color: pOpenTillaggstjanst ? "#3A413C" : "#5C594E" }}>{pOpenTillaggstjanst}</td>
@@ -2122,16 +2130,16 @@ function Oversikt({ state, scopedProps, selectedProperty, selectedOrg, setTab, o
 
       <div style={S.statGrid}>
         <StatCard
-          label="Försenade uppgifter"
-          value={overdue.length}
-          tone={overdue.length ? "warn" : "ok"}
-          onClick={() => setTab("uppgifter")}
+          label="Att pricka av"
+          value={dueNow.length}
+          tone={dueNow.length ? "warn" : "ok"}
+          onClick={() => setTab("checklistor")}
         />
         <StatCard
-          label="Inom 7 dagar"
-          value={dueSoon.length}
-          tone="accent"
-          onClick={() => setTab("uppgifter")}
+          label="Missade perioder"
+          value={missed.length}
+          tone={missed.length ? "warn" : "neutral"}
+          onClick={() => setTab("checklistor")}
         />
         <StatCard
           label="Öppna ärenden"
@@ -2155,18 +2163,18 @@ function Oversikt({ state, scopedProps, selectedProperty, selectedOrg, setTab, o
 
       <div style={S.twoCol}>
         <section style={S.panel}>
-          <h3 style={S.panelTitle}>Försenat & nära förfall</h3>
-          {overdue.length + dueSoon.length === 0 ? (
-            <EmptyNote text="Inget att stämpla just nu. Bra läge." />
+          <h3 style={S.panelTitle}>Checklistor att pricka av</h3>
+          {dueNow.length === 0 ? (
+            <EmptyNote text="Alla checklistor är avprickade för sina perioder. Bra läge." />
           ) : (
             <ul style={S.plainList}>
-              {[...overdue, ...dueSoon].slice(0, 8).map((t) => (
-                <li key={t.id} style={S.rowItem}>
-                  <span style={{ ...S.dot, background: t.nextDue < today ? "#C4171C" : "#3A413C" }} />
+              {dueNow.slice(0, 8).map((c) => (
+                <li key={c.template.id} style={S.rowItem}>
+                  <span style={{ ...S.dot, background: c.missedPrev ? "#C4171C" : "#C49A2A" }} />
                   <span style={{ flex: 1 }}>
-                    <div style={S.rowTitle}>{t.title}</div>
+                    <div style={S.rowTitle}>{c.template.title}</div>
                     <div style={S.rowSub}>
-                      {propName(t.propertyId)} · förfaller {fmtDate(t.nextDue)}
+                      {propName(c.template.propertyId)} · {periodLabel(c.curKey, c.interval)} ej bekräftad{c.missedPrev ? " · även föregående missad" : ""}
                     </div>
                   </span>
                 </li>
@@ -2392,10 +2400,25 @@ function Checklistor({ state, setState, scopedProps, actor, notify }) {
   const ids = new Set(scopedProps.map((p) => p.id));
   const showPropertyTag = scopedProps.length > 1;
   const propName = (id) => state.properties.find((p) => p.id === id)?.name || "";
-  const templates = state.checklistTemplates.filter((t) => ids.has(t.propertyId));
+
+  // Checklistor inom valt scope, uppdelade i aktiva och inaktiverade.
+  // Äldre checklistor saknar `active`-fältet och räknas som aktiva.
+  const scopedTemplates = state.checklistTemplates.filter((t) => ids.has(t.propertyId));
+  const templates = scopedTemplates.filter((t) => t.active !== false);
+  const inactiveTemplates = scopedTemplates.filter((t) => t.active === false);
 
   // Vilken periodruta som är öppen just nu: { templateId, period }.
   const [active, setActive] = useState(null);
+
+  // Bekräftelseläge för borttagning/inaktivering av en checklista.
+  const [confirmRemoveId, setConfirmRemoveId] = useState(null);
+
+  // Redigering av manuell kommentar per checklista.
+  const [commentEditId, setCommentEditId] = useState(null);
+  const [commentDraft, setCommentDraft] = useState("");
+
+  // Visa/dölj listan över inaktiverade checklistor.
+  const [showInactive, setShowInactive] = useState(false);
 
   const addTemplate = (payload) => {
     setState({
@@ -2406,6 +2429,8 @@ function Checklistor({ state, setState, scopedProps, actor, notify }) {
           id: uid(),
           ...payload,
           interval: payload.interval || "vecka",
+          comment: (payload.comment || "").trim(),
+          active: true,
           items: payload.items.map((text) => ({ id: uid(), text })),
         },
       ],
@@ -2413,12 +2438,63 @@ function Checklistor({ state, setState, scopedProps, actor, notify }) {
     setShowForm(false);
   };
 
-  const removeTemplate = (id) =>
+  // Finns det någon bekräftad period för checklistan? Bekräftade perioder är
+  // permanenta poster och får aldrig raderas — då inaktiverar vi istället.
+  const hasConfirmedRuns = (templateId) =>
+    state.checklistRuns.some((r) => r.templateId === templateId && r.done);
+
+  // Ta bort helt — tillåtet endast när ingen period någonsin bekräftats
+  // (dvs. checklistan lades upp av misstag).
+  const deleteTemplate = (id) => {
     setState({
       ...state,
       checklistTemplates: state.checklistTemplates.filter((t) => t.id !== id),
       checklistRuns: state.checklistRuns.filter((r) => r.templateId !== id),
     });
+    setConfirmRemoveId(null);
+    notify("Checklistan togs bort");
+  };
+
+  // Inaktivera — behåller checklistan och alla bekräftade perioder som
+  // historik, men döljer den från listan över aktiva checklistor.
+  const deactivateTemplate = (id) => {
+    setState({
+      ...state,
+      checklistTemplates: state.checklistTemplates.map((t) =>
+        t.id === id ? { ...t, active: false } : t
+      ),
+    });
+    setConfirmRemoveId(null);
+    if (active && active.templateId === id) setActive(null);
+    notify("Checklistan inaktiverades — historiken finns kvar");
+  };
+
+  const reactivateTemplate = (id) => {
+    setState({
+      ...state,
+      checklistTemplates: state.checklistTemplates.map((t) =>
+        t.id === id ? { ...t, active: true } : t
+      ),
+    });
+    notify("Checklistan återaktiverades");
+  };
+
+  // Spara manuell kommentar på en checklista.
+  const saveComment = (id, text) => {
+    setState({
+      ...state,
+      checklistTemplates: state.checklistTemplates.map((t) =>
+        t.id === id ? { ...t, comment: (text || "").trim() } : t
+      ),
+    });
+    setCommentEditId(null);
+    setCommentDraft("");
+  };
+
+  const startEditComment = (tmpl) => {
+    setCommentEditId(tmpl.id);
+    setCommentDraft(tmpl.comment || "");
+  };
 
   // Körningen för en viss period. Äldre körningar utan period härleds från datumet.
   const runFor = (templateId, period, interval) =>
@@ -2460,30 +2536,65 @@ function Checklistor({ state, setState, scopedProps, actor, notify }) {
     });
   };
 
-  // Bekräfta att ronderingen är gjord för perioden.
+  // Bocka i / ur alla punkter på en gång.
+  const setAllItems = (run, items, checkAll) => {
+    setState({
+      ...state,
+      checklistRuns: state.checklistRuns.map((r) =>
+        r.id === run.id ? { ...r, checkedItemIds: checkAll ? items.map((i) => i.id) : [] } : r
+      ),
+    });
+  };
+
+  // Bekräfta att ronderingen är gjord för perioden (loggas).
   const confirmRun = (run) => {
     setState({
       ...state,
       checklistRuns: state.checklistRuns.map((r) =>
-        r.id === run.id ? { ...r, done: true, date: todayISO(), doneBy: actor || "Okänd" } : r
+        r.id === run.id
+          ? {
+              ...r,
+              done: true,
+              date: todayISO(),
+              doneBy: actor || "Okänd",
+              logg: [...(r.logg || []), { datum: todayISO(), av: actor || "Okänd", handelse: "Bekräftad" }],
+            }
+          : r
       ),
     });
-    notify("Rondering bekräftad för perioden");
+    notify("Perioden bekräftad");
     setActive(null);
   };
 
-  // Ångra en bekräftad period (t.ex. felklick) — körningen finns kvar men markeras ej klar.
-  const reopenRun = (run) => {
+  // Återöppning kräver en orsak (loggas). reopenTarget styr vilket periodkort
+  // som visar orsaksfältet.
+  const [reopenTarget, setReopenTarget] = useState(null);
+  const [reopenReason, setReopenReason] = useState("");
+
+  const reopenRun = (run, reason) => {
     setState({
       ...state,
-      checklistRuns: state.checklistRuns.map((r) => (r.id === run.id ? { ...r, done: false } : r)),
+      checklistRuns: state.checklistRuns.map((r) =>
+        r.id === run.id
+          ? {
+              ...r,
+              done: false,
+              logg: [
+                ...(r.logg || []),
+                { datum: todayISO(), av: actor || "Okänd", handelse: "Öppnad igen", kommentar: (reason || "").trim() },
+              ],
+            }
+          : r
+      ),
     });
+    setReopenTarget(null);
+    setReopenReason("");
   };
 
   return (
     <div style={{ animation: "fk-rise .25s ease" }}>
       <div style={S.sectionHead}>
-        <h2 style={S.h2}>Checklistor för rondering</h2>
+        <h2 style={S.h2}>Checklistor</h2>
         <button style={showForm ? S.secondaryBtn : S.addBtn} className="fk-btn" onClick={() => setShowForm((s) => !s)}>
           {showForm ? "Avbryt" : "+ Ny checklista"}
         </button>
@@ -2492,15 +2603,17 @@ function Checklistor({ state, setState, scopedProps, actor, notify }) {
       {showForm && <ChecklistForm properties={scopedProps} onSubmit={addTemplate} />}
 
       {templates.length === 0 ? (
-        <EmptyNote text="Inga checklistor ännu. Skapa en mall för t.ex. veckorondering." />
+        <EmptyNote text="Inga checklistor ännu. Skapa en mall, t.ex. en veckovis kontroll." />
       ) : (
         <div style={S.checklistStack}>
           {templates.map((tmpl) => {
             const interval = tmpl.interval || "vecka";
             const periods = recentPeriods(interval, periodCount(interval));
             const currentKey = periodKey(new Date(), interval);
+            const currentDone = !!runFor(tmpl.id, currentKey, interval)?.done;
             const last = lastDoneRun(tmpl.id, interval);
-            const intervalLabel = interval === "vecka" ? "Varje vecka" : interval === "månad" ? "Varje månad" : "Varje år";
+            const intervalLabel = INTERVAL_NAMES[interval] || "Varje vecka";
+            const dueWord = interval === "vecka" ? "vecka" : interval === "månad" ? "månad" : interval === "kvartal" ? "kvartal" : "år";
             const activeRun =
               active && active.templateId === tmpl.id ? runFor(tmpl.id, active.period, interval) : null;
             return (
@@ -2513,18 +2626,167 @@ function Checklistor({ state, setState, scopedProps, actor, notify }) {
                     </div>
                     <div style={S.taskCardProp}>{tmpl.items.length} punkter · {intervalLabel}</div>
                   </div>
-                  <button style={S.miniDelete} onClick={() => removeTemplate(tmpl.id)} aria-label="Ta bort checklista">×</button>
+                  <button
+                    style={S.miniDelete}
+                    onClick={() => setConfirmRemoveId(confirmRemoveId === tmpl.id ? null : tmpl.id)}
+                    aria-label="Ta bort eller inaktivera checklista"
+                  >×</button>
                 </div>
 
-                {/* Periodrutnät: en ruta per period (vecka/månad/år). Grön ✓ =
-                    bekräftad, gul = påbörjad. Tryck på en ruta för att pricka av. */}
+                {/* Säkert flöde för att ta bort / inaktivera. En checklista med
+                    bekräftade perioder kan inte raderas — då erbjuds inaktivering
+                    så att historiken bevaras. */}
+                {confirmRemoveId === tmpl.id && (() => {
+                  const locked = hasConfirmedRuns(tmpl.id);
+                  return (
+                    <div
+                      style={{
+                        marginTop: 8,
+                        padding: "10px 12px",
+                        borderRadius: 8,
+                        border: `1px solid ${locked ? "#C9C4B7" : "#C4171C"}`,
+                        background: locked ? "#F5F3EE" : "#FCEDED",
+                      }}
+                    >
+                      {locked ? (
+                        <>
+                          <div style={{ ...S.rowSub, marginBottom: 8, color: "#3A413C" }}>
+                            Den här checklistan har bekräftade perioder och kan inte tas bort —
+                            de är permanenta poster. Du kan istället <strong>inaktivera</strong> den.
+                            Den försvinner då från listan över aktiva checklistor men historiken finns kvar.
+                          </div>
+                          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                            <button
+                              style={S.secondaryBtnSmall}
+                              className="fk-btn"
+                              onClick={() => deactivateTemplate(tmpl.id)}
+                            >
+                              Inaktivera checklistan
+                            </button>
+                            <button style={S.linkBtn} className="fk-btn" onClick={() => setConfirmRemoveId(null)}>
+                              Avbryt
+                            </button>
+                          </div>
+                        </>
+                      ) : (
+                        <>
+                          <div style={{ ...S.rowSub, marginBottom: 8, color: "#7A1418" }}>
+                            Ta bort checklistan helt? Ingen period har bekräftats, så inget historiskt
+                            underlag går förlorat.
+                          </div>
+                          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                            <button
+                              style={{ ...S.primaryBtnSmall, background: "#C4171C" }}
+                              className="fk-btn"
+                              onClick={() => deleteTemplate(tmpl.id)}
+                            >
+                              Bekräfta borttagning
+                            </button>
+                            <button style={S.linkBtn} className="fk-btn" onClick={() => setConfirmRemoveId(null)}>
+                              Avbryt
+                            </button>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  );
+                })()}
+
+                {/* Manuell kommentar för checklistan. */}
+                {commentEditId === tmpl.id ? (
+                  <div style={{ marginTop: 10 }}>
+                    <textarea
+                      className="fk-input"
+                      style={{ ...S.input, width: "100%", height: 70, resize: "vertical", boxSizing: "border-box" }}
+                      value={commentDraft}
+                      onChange={(e) => setCommentDraft(e.target.value)}
+                      placeholder="Skriv en kommentar för den här checklistan…"
+                      autoFocus
+                    />
+                    <div style={{ display: "flex", gap: 8, marginTop: 6, flexWrap: "wrap" }}>
+                      <button style={S.primaryBtnSmall} className="fk-btn" onClick={() => saveComment(tmpl.id, commentDraft)}>
+                        Spara kommentar
+                      </button>
+                      <button style={S.linkBtn} className="fk-btn" onClick={() => { setCommentEditId(null); setCommentDraft(""); }}>
+                        Avbryt
+                      </button>
+                    </div>
+                  </div>
+                ) : tmpl.comment ? (
+                  <div
+                    style={{
+                      marginTop: 10,
+                      padding: "8px 12px",
+                      borderRadius: 6,
+                      background: "#F5F3EE",
+                      border: "1px solid #E5E1D6",
+                      fontSize: 13,
+                      color: "#3A413C",
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "flex-start",
+                      gap: 10,
+                    }}
+                  >
+                    <span style={{ whiteSpace: "pre-wrap" }}>💬 {tmpl.comment}</span>
+                    <button style={S.linkBtn} className="fk-btn" onClick={() => startEditComment(tmpl)}>
+                      Ändra
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    style={{ ...S.linkBtn, marginTop: 8, color: "#2B6E5E" }}
+                    className="fk-btn"
+                    onClick={() => startEditComment(tmpl)}
+                  >
+                    + Lägg till kommentar
+                  </button>
+                )}
+
+                {/* "Dags nu"-signal: innevarande period är inte bekräftad ännu. */}
+                {!currentDone && (
+                  <div
+                    style={{
+                      marginTop: 8,
+                      padding: "8px 12px",
+                      borderRadius: 6,
+                      border: "1px solid #C49A2A",
+                      background: "#FBF3DF",
+                      fontSize: 13,
+                      color: "#7A5B12",
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      gap: 8,
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <span>⏰ Dags för denna {dueWord} — {periodLabel(currentKey, interval)} är inte bekräftad ännu.</span>
+                    <button
+                      style={{ ...S.stampBtn, background: "#C49A2A", color: "#fff" }}
+                      className="fk-btn"
+                      onClick={() => openPeriod(tmpl, currentKey)}
+                    >
+                      Pricka av nu
+                    </button>
+                  </div>
+                )}
+
+                {/* Periodrutnät: en ruta per period (vecka/månad/år).
+                    Grön ✓ = bekräftad och alla punkter ibockade.
+                    Orange ✓ = bekräftad men alla punkter var inte ibockade.
+                    Gul = påbörjad (ej bekräftad). Tryck på en ruta för att pricka av. */}
                 <div style={{ display: "flex", gap: 6, overflowX: "auto", paddingBottom: 4, marginTop: 6 }}>
                   {periods.map((pk) => {
                     const run = runFor(tmpl.id, pk, interval);
                     const done = !!run?.done;
+                    // Bekräftad men inte alla punkter ibockade → orange markör.
+                    const doneIncomplete =
+                      done && tmpl.items.length > 0 && run.checkedItemIds.length < tmpl.items.length;
                     const partial = run && !done && run.checkedItemIds.length > 0;
                     const isActive = active && active.templateId === tmpl.id && active.period === pk;
                     const isCurrent = pk === currentKey;
+                    const doneColor = doneIncomplete ? "#E0871E" : "#2B6E5E";
                     return (
                       <button
                         key={pk}
@@ -2538,8 +2800,8 @@ function Checklistor({ state, setState, scopedProps, actor, notify }) {
                           cursor: "pointer",
                           border: isActive
                             ? "2px solid #2B6E5E"
-                            : `1px solid ${done ? "#2B6E5E" : partial ? "#C49A2A" : "#C9C4B7"}`,
-                          background: done ? "#2B6E5E" : "#fff",
+                            : `1px solid ${done ? doneColor : partial ? "#C49A2A" : "#C9C4B7"}`,
+                          background: done ? doneColor : "#fff",
                           color: done ? "#fff" : "#3A413C",
                           display: "flex",
                           flexDirection: "column",
@@ -2551,7 +2813,9 @@ function Checklistor({ state, setState, scopedProps, actor, notify }) {
                         <span style={{ fontSize: 12, fontWeight: 700 }}>
                           {done ? "✓" : partial ? `${run.checkedItemIds.length}/${tmpl.items.length}` : "–"}
                         </span>
-                        <span style={{ fontSize: 9, opacity: 0.7, minHeight: 11 }}>{isCurrent ? "nu" : ""}</span>
+                        <span style={{ fontSize: 9, opacity: 0.85, minHeight: 11 }}>
+                          {doneIncomplete ? `${run.checkedItemIds.length}/${tmpl.items.length}` : isCurrent ? "nu" : ""}
+                        </span>
                       </button>
                     );
                   })}
@@ -2559,9 +2823,28 @@ function Checklistor({ state, setState, scopedProps, actor, notify }) {
 
                 {activeRun && (
                   <div style={S.runBox}>
-                    <div style={{ ...S.rowSub, marginBottom: 6, fontWeight: 600 }}>
-                      {periodLabel(activeRun.period || active.period, interval)}
-                      {activeRun.done ? " · bekräftad" : ""}
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
+                      <span style={{ ...S.rowSub, fontWeight: 600, margin: 0 }}>
+                        {periodLabel(activeRun.period || active.period, interval)}
+                        {activeRun.done ? " · bekräftad" : ""}
+                        {activeRun.done &&
+                          tmpl.items.length > 0 &&
+                          activeRun.checkedItemIds.length < tmpl.items.length && (
+                            <span style={{ color: "#E0871E", fontWeight: 700 }}> · ⚠ ej alla punkter ibockade</span>
+                          )}
+                      </span>
+                      {tmpl.items.length > 0 && (() => {
+                        const allChecked = tmpl.items.every((i) => activeRun.checkedItemIds.includes(i.id));
+                        return (
+                          <button
+                            style={S.secondaryBtnSmall || S.secondaryBtn}
+                            className="fk-btn"
+                            onClick={() => setAllItems(activeRun, tmpl.items, !allChecked)}
+                          >
+                            {allChecked ? "Avmarkera alla" : "Markera alla"}
+                          </button>
+                        );
+                      })()}
                     </div>
                     {tmpl.items.map((item) => {
                       const checked = activeRun.checkedItemIds.includes(item.id);
@@ -2588,16 +2871,61 @@ function Checklistor({ state, setState, scopedProps, actor, notify }) {
                           <button style={S.primaryBtnSmall} className="fk-btn" onClick={() => confirmRun(activeRun)}>
                             Bekräfta perioden
                           </button>
-                        ) : (
-                          <button style={S.secondaryBtnSmall || S.secondaryBtn} className="fk-btn" onClick={() => reopenRun(activeRun)}>
+                        ) : reopenTarget !== activeRun.id ? (
+                          <button
+                            style={S.secondaryBtnSmall || S.secondaryBtn}
+                            className="fk-btn"
+                            onClick={() => { setReopenTarget(activeRun.id); setReopenReason(""); }}
+                          >
                             Ångra bekräftelse
                           </button>
-                        )}
+                        ) : null}
                         <button style={S.linkBtn} className="fk-btn" onClick={() => setActive(null)}>
                           Stäng
                         </button>
                       </div>
                     </div>
+
+                    {reopenTarget === activeRun.id && (
+                      <div style={{ marginTop: 8, padding: "10px 12px", border: "1px solid #C9C4B7", borderRadius: 8 }}>
+                        <div style={{ ...S.rowSub, marginBottom: 6 }}>
+                          Ange varför perioden öppnas igen — det sparas i loggen tillsammans med vem och när.
+                        </div>
+                        <input
+                          className="fk-input"
+                          style={S.input}
+                          value={reopenReason}
+                          onChange={(e) => setReopenReason(e.target.value)}
+                          placeholder="t.ex. En punkt missades och behöver göras om"
+                          autoFocus
+                        />
+                        <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+                          <button
+                            style={{ ...S.primaryBtnSmall, opacity: reopenReason.trim() ? 1 : 0.5 }}
+                            className="fk-btn"
+                            disabled={!reopenReason.trim()}
+                            onClick={() => reopenRun(activeRun, reopenReason)}
+                          >
+                            Bekräfta öppning
+                          </button>
+                          <button style={S.linkBtn} className="fk-btn" onClick={() => { setReopenTarget(null); setReopenReason(""); }}>
+                            Avbryt
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {(activeRun.logg || []).length > 0 && (
+                      <div style={{ ...S.rowSub, marginTop: 8, fontSize: 12 }}>
+                        <div style={{ fontWeight: 600, marginBottom: 2 }}>Logg</div>
+                        {(activeRun.logg || []).map((l, i) => (
+                          <div key={i} style={{ marginBottom: 2 }}>
+                            {l.handelse} {fmtDate(l.datum)} av {l.av}
+                            {l.kommentar ? <span style={{ color: "#B07A16" }}> — {l.kommentar}</span> : null}
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -2611,6 +2939,57 @@ function Checklistor({ state, setState, scopedProps, actor, notify }) {
           })}
         </div>
       )}
+
+      {/* Inaktiverade checklistor — dolda från den aktiva listan, men historiken
+          finns kvar och de kan återaktiveras. */}
+      {inactiveTemplates.length > 0 && (
+        <div style={{ marginTop: 22 }}>
+          <button
+            style={{ ...S.linkBtn, color: "#5C594E" }}
+            className="fk-btn"
+            onClick={() => setShowInactive((s) => !s)}
+          >
+            {showInactive ? "▾" : "▸"} Inaktiverade checklistor ({inactiveTemplates.length})
+          </button>
+          {showInactive && (
+            <div style={{ ...S.checklistStack, marginTop: 10 }}>
+              {inactiveTemplates.map((tmpl) => {
+                const interval = tmpl.interval || "vecka";
+                const intervalLabel = INTERVAL_NAMES[interval] || "Varje vecka";
+                const confirmedCount = state.checklistRuns.filter(
+                  (r) => r.templateId === tmpl.id && r.done
+                ).length;
+                return (
+                  <div key={tmpl.id} style={{ ...S.checklistCard, opacity: 0.85, background: "#F7F5F0" }}>
+                    <div style={S.checklistHead}>
+                      <div>
+                        <div style={{ ...S.taskCardTitle, color: "#5C594E" }}>
+                          {tmpl.title}
+                          {showPropertyTag && <span style={S.propertyTag}>{propName(tmpl.propertyId)}</span>}
+                        </div>
+                        <div style={S.taskCardProp}>
+                          Inaktiverad · {tmpl.items.length} punkter · {intervalLabel}
+                          {confirmedCount > 0 ? ` · ${confirmedCount} bekräftade perioder sparade` : ""}
+                        </div>
+                      </div>
+                      <button
+                        style={S.secondaryBtnSmall}
+                        className="fk-btn"
+                        onClick={() => reactivateTemplate(tmpl.id)}
+                      >
+                        Återaktivera
+                      </button>
+                    </div>
+                    {tmpl.comment && (
+                      <div style={{ ...S.rowSub, marginTop: 8 }}>💬 {tmpl.comment}</div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -2620,12 +2999,13 @@ function ChecklistForm({ properties, onSubmit }) {
   const [itemsText, setItemsText] = useState("");
   const [propertyId, setPropertyId] = useState(properties[0]?.id || "");
   const [interval, setInterval] = useState("vecka");
+  const [comment, setComment] = useState("");
 
   const submit = (e) => {
     e.preventDefault();
     const items = itemsText.split("\n").map((s) => s.trim()).filter(Boolean);
     if (!title.trim() || !propertyId || items.length === 0) return;
-    onSubmit({ title: title.trim(), propertyId, interval, items });
+    onSubmit({ title: title.trim(), propertyId, interval, items, comment });
   };
 
   return (
@@ -2633,7 +3013,7 @@ function ChecklistForm({ properties, onSubmit }) {
       <div style={S.formRow}>
         <label style={S.label}>
           Namn på checklista
-          <input className="fk-input" style={S.input} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="t.ex. Veckorondering källare" required />
+          <input className="fk-input" style={S.input} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="t.ex. Veckokontroll källare" required />
         </label>
         <PropertyPicker properties={properties} value={propertyId} onChange={setPropertyId} />
       </div>
@@ -2642,7 +3022,7 @@ function ChecklistForm({ properties, onSubmit }) {
           Intervall
           <select className="fk-input" style={S.input} value={interval} onChange={(e) => setInterval(e.target.value)}>
             {CHECKLIST_INTERVALS.map((iv) => (
-              <option key={iv} value={iv}>{iv === "vecka" ? "Varje vecka" : iv === "månad" ? "Varje månad" : "Varje år"}</option>
+              <option key={iv} value={iv}>{INTERVAL_NAMES[iv]}</option>
             ))}
           </select>
         </label>
@@ -2657,6 +3037,16 @@ function ChecklistForm({ properties, onSubmit }) {
           onChange={(e) => setItemsText(e.target.value)}
           placeholder={"Kontrollera belysning\nProva branddörrar\nKolla fuktskador"}
           required
+        />
+      </label>
+      <label style={S.label}>
+        Kommentar (valfritt)
+        <textarea
+          className="fk-input"
+          style={{ ...S.input, height: 60, resize: "vertical" }}
+          value={comment}
+          onChange={(e) => setComment(e.target.value)}
+          placeholder="t.ex. Nyckel finns hos vaktmästaren"
         />
       </label>
       <button type="submit" style={S.addBtn} className="fk-btn">Spara checklista</button>
@@ -3234,6 +3624,24 @@ function DebiteringOrderCard({ order: o, billing, propertyName, onOpen }) {
 
 /* ------------------------------ felanmälan / tilläggstjänster (delad kö) ------------------------------ */
 
+// Visar var en felanmälan kommer ifrån: från en boende (med namn/kontaktuppgifter)
+// eller registrerad manuellt av någon inloggad. Källan härleds ur om det finns
+// uppgifter om en anmälare — inga extra fält behöver lagras.
+function KallaRad({ order }) {
+  const franBoende = !!(order.reporterName || order.reporterContact || order.reporterAddress);
+  const kontakt = [order.reporterName, order.reporterContact].filter(Boolean).join(" · ");
+  return (
+    <div style={{ ...S.rowSub, marginTop: 6, display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+      <span style={S.kallaTag}>{franBoende ? "Från boende" : "Registrerad manuellt"}</span>
+      <span>
+        {franBoende
+          ? kontakt || "kontaktuppgifter saknas"
+          : `av ${order.createdBy || "okänd"}`}
+      </span>
+    </div>
+  );
+}
+
 function ArendeQueue({ type, title, newLabel, titleFieldLabel, titlePlaceholder, emptyText, state, scopedProps, billing, notify }) {
   const [showForm, setShowForm] = useState(false);
   const [openOrderId, setOpenOrderId] = useState(null);
@@ -3339,6 +3747,7 @@ function ArendeQueue({ type, title, newLabel, titleFieldLabel, titlePlaceholder,
               <div style={S.taskCardProp}>
                 Inkom {fmtDate(o.reportedDate)} · makulerad {fmtDate(o.cancelledAt)} av {o.cancelledBy}
               </div>
+              {type === "felanmalan" && <KallaRad order={o} />}
               <div style={{ ...S.rowSub, marginTop: 6 }}>Orsak: {o.cancelledReason}</div>
             </div>
             <button style={S.stampBtn} className="fk-btn" onClick={() => setOpenOrderId(o.id)}>
@@ -3362,6 +3771,7 @@ function ArendeQueue({ type, title, newLabel, titleFieldLabel, titlePlaceholder,
               <div style={S.taskCardProp}>
                 Inkom {fmtDate(o.reportedDate)} · klarmarkerad {fmtDate(o.completedAt)}
               </div>
+              {type === "felanmalan" && <KallaRad order={o} />}
             </div>
             <button style={S.stampBtn} className="fk-btn" onClick={() => setOpenOrderId(o.id)}>
               Visa
@@ -3392,11 +3802,7 @@ function ArendeQueue({ type, title, newLabel, titleFieldLabel, titlePlaceholder,
               </div>
             )}
             {o.description && <div style={{ ...S.rowSub, marginTop: 6 }}>{o.description}</div>}
-            {(o.reporterName || o.reporterContact) && (
-              <div style={{ ...S.rowSub, marginTop: 4, fontStyle: "italic" }}>
-                Anmält av: {[o.reporterName, o.reporterContact].filter(Boolean).join(" · ")}
-              </div>
-            )}
+            {type === "felanmalan" && <KallaRad order={o} />}
           </div>
         </div>
 
@@ -3438,6 +3844,7 @@ function ArendeQueue({ type, title, newLabel, titleFieldLabel, titlePlaceholder,
           titleFieldLabel={titleFieldLabel}
           titlePlaceholder={titlePlaceholder}
           onSubmit={addOrder}
+          showReporter={type === "felanmalan"}
         />
       )}
 
@@ -3482,7 +3889,7 @@ function ArendeQueue({ type, title, newLabel, titleFieldLabel, titlePlaceholder,
   );
 }
 
-function ArendeForm({ properties, nextOrderNumber, titleFieldLabel, titlePlaceholder, onSubmit }) {
+function ArendeForm({ properties, nextOrderNumber, titleFieldLabel, titlePlaceholder, onSubmit, showReporter }) {
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [priceCategory, setPriceCategory] = useState("FA");
@@ -3490,10 +3897,24 @@ function ArendeForm({ properties, nextOrderNumber, titleFieldLabel, titlePlaceho
   const [propertyId, setPropertyId] = useState(properties[0]?.id || "");
   const [debiterBil, setDebiterBil] = useState(false);
   const [billCount, setBillCount] = useState(1);
+  // Valfritt: anmälan kommer från en boende (t.ex. via telefon). Är rutan av
+  // registreras felanmälan som "manuell" och märks med den inloggade som källa.
+  const [franBoende, setFranBoende] = useState(false);
+  const [reporterName, setReporterName] = useState("");
+  const [reporterContact, setReporterContact] = useState("");
+  const [reporterAddress, setReporterAddress] = useState("");
 
   const submit = (e) => {
     e.preventDefault();
     if (!title.trim() || !propertyId) return;
+    const boende =
+      showReporter && franBoende
+        ? {
+            reporterName: reporterName.trim(),
+            reporterContact: reporterContact.trim(),
+            reporterAddress: reporterAddress.trim(),
+          }
+        : {};
     onSubmit({
       title: title.trim(),
       description: description.trim(),
@@ -3501,6 +3922,7 @@ function ArendeForm({ properties, nextOrderNumber, titleFieldLabel, titlePlaceho
       priceCategory,
       reportedDate,
       billCount: debiterBil ? Math.max(1, Number(billCount) || 1) : 0,
+      ...boende,
     });
   };
 
@@ -3542,6 +3964,45 @@ function ArendeForm({ properties, nextOrderNumber, titleFieldLabel, titlePlaceho
           placeholder="Beskriv jobbet, valfritt men bra att fylla i medan du är på plats"
         />
       </label>
+
+      {showReporter && (
+        <div style={{ ...S.formPanel, background: "#F7F5EF", padding: 14, marginTop: 4, marginBottom: 4 }}>
+          <label style={S.checkRow}>
+            <input
+              type="checkbox"
+              checked={franBoende}
+              onChange={(e) => setFranBoende(e.target.checked)}
+              style={S.checkbox}
+            />
+            Anmält av en boende (t.ex. via telefon)
+          </label>
+          {franBoende ? (
+            <>
+              <div style={{ ...S.rowSub, marginTop: 8, marginBottom: 4 }}>
+                Notera vem som anmält. Lämnar du fälten tomma registreras felanmälan ändå som "från boende".
+              </div>
+              <div style={S.formRow}>
+                <label style={S.label}>
+                  Namn
+                  <input className="fk-input" style={S.input} value={reporterName} onChange={(e) => setReporterName(e.target.value)} placeholder="t.ex. Anna Andersson" />
+                </label>
+                <label style={S.label}>
+                  Kontaktuppgifter
+                  <input className="fk-input" style={S.input} value={reporterContact} onChange={(e) => setReporterContact(e.target.value)} placeholder="telefon eller e-post" />
+                </label>
+              </div>
+              <label style={S.label}>
+                Adress / lägenhet
+                <input className="fk-input" style={S.input} value={reporterAddress} onChange={(e) => setReporterAddress(e.target.value)} placeholder="t.ex. Storgatan 1 B, lgh 1102" />
+              </label>
+            </>
+          ) : (
+            <div style={{ ...S.rowSub, marginTop: 6 }}>
+              Lämnas rutan tom registreras felanmälan som "registrerad manuellt" med dig som källa.
+            </div>
+          )}
+        </div>
+      )}
 
       <div style={S.bilRow}>
         <label style={S.checkRow}>
@@ -3651,11 +4112,7 @@ function OrderDetail({
             </div>
           )}
           {order.description && <div style={{ ...S.rowSub, marginTop: 4 }}>{order.description}</div>}
-          {(order.reporterName || order.reporterContact) && (
-            <div style={{ ...S.rowSub, marginTop: 4, fontStyle: "italic" }}>
-              Anmält av: {[order.reporterName, order.reporterContact].filter(Boolean).join(" · ")}
-            </div>
-          )}
+          {order.type === "felanmalan" && <KallaRad order={order} />}
         </div>
         {!readOnly && onComplete && (
           <button style={S.primaryBtnSmall} className="fk-btn" onClick={onComplete}>
@@ -4492,8 +4949,12 @@ const monthLabel = (ym) => {
 const thisMonthISO = () => todayISO().slice(0, 7);
 
 /* --- Perioder för återkommande checklistor (vecka/månad/år) --- */
-const CHECKLIST_INTERVALS = ["vecka", "månad", "år"];
-const periodCount = (interval) => (interval === "år" ? 5 : 12);
+const CHECKLIST_INTERVALS = ["vecka", "månad", "kvartal", "år"];
+const INTERVAL_NAMES = { vecka: "Varje vecka", månad: "Varje månad", kvartal: "Varje kvartal", år: "Varje år" };
+// Antal perioder som visas i rutnätet. Veckochecklistor visar innevarande
+// vecka + 4 veckor bakåt (räcker gott — äldre historik behöver inte synas här).
+const periodCount = (interval) =>
+  interval === "år" ? 5 : interval === "kvartal" ? 8 : interval === "månad" ? 12 : 5;
 
 // ISO-veckonummer (måndag som veckans start, torsdagsregeln).
 function isoWeek(d) {
@@ -4511,6 +4972,7 @@ function isoWeek(d) {
 function periodKey(dateLike, interval) {
   const d = typeof dateLike === "string" ? new Date(dateLike) : dateLike;
   if (interval === "år") return `${d.getFullYear()}`;
+  if (interval === "kvartal") return `${d.getFullYear()}-Q${Math.floor(d.getMonth() / 3) + 1}`;
   if (interval === "månad") return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
   const { year, week } = isoWeek(d);
   return `${year}-v${String(week).padStart(2, "0")}`;
@@ -4519,6 +4981,7 @@ function periodKey(dateLike, interval) {
 // Kort etikett till kolumnrutorna.
 function shortPeriodLabel(key, interval) {
   if (interval === "år") return key;
+  if (interval === "kvartal") return `Q${key.split("-Q")[1]}`;
   if (interval === "månad") {
     const [y, m] = key.split("-");
     return new Date(Number(y), Number(m) - 1, 1).toLocaleDateString("sv-SE", { month: "short" });
@@ -4529,6 +4992,10 @@ function shortPeriodLabel(key, interval) {
 // Lång etikett (t.ex. i "senast bekräftad").
 function periodLabel(key, interval) {
   if (interval === "år") return key;
+  if (interval === "kvartal") {
+    const [y, q] = key.split("-Q");
+    return `Q${q} ${y}`;
+  }
   if (interval === "månad") return monthLabel(key);
   const [y, w] = key.split("-v");
   return `v.${Number(w)} ${y}`;
@@ -4541,6 +5008,7 @@ function recentPeriods(interval, count) {
   for (let i = count - 1; i >= 0; i--) {
     const d = new Date(now);
     if (interval === "år") d.setFullYear(now.getFullYear() - i);
+    else if (interval === "kvartal") d.setMonth(now.getMonth() - i * 3);
     else if (interval === "månad") d.setMonth(now.getMonth() - i);
     else d.setDate(now.getDate() - i * 7);
     keys.push(periodKey(d, interval));
@@ -6807,6 +7275,18 @@ const S = {
     borderRadius: 4,
     padding: "2px 8px",
     verticalAlign: "middle",
+  },
+  kallaTag: {
+    fontSize: 10.5,
+    fontWeight: 600,
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+    color: "#5C594E",
+    background: "#EDEAE1",
+    border: "1px solid #C9C4B7",
+    borderRadius: 4,
+    padding: "2px 8px",
+    whiteSpace: "nowrap",
   },
   orderNumberTag: {
     fontFamily: "'IBM Plex Mono', monospace",

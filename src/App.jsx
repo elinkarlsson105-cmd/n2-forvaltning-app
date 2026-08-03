@@ -24,7 +24,6 @@ const ROW_ID = "shared";
 const TABLE = "fonsterkort_state";
 
 const CATEGORIES = ["Snöröjning", "Filterbyte", "Gräsklippning", "Brandskydd", "VVS", "El", "Städ", "Övrigt"];
-const PRIORITIES = ["Låg", "Normal", "Akut"];
 const STATUSES = ["Öppen", "Pågår", "Klar"];
 // Färgkodning för statusrutorna i Ärenden: Klar = grön, Pågår = gul/guld,
 // Öppen = neutral mörk (som tidigare). Håller sig till appens palett.
@@ -2216,7 +2215,6 @@ function Oversikt({ state, scopedProps, selectedProperty, selectedOrg, setTab, o
   });
   const dueNow = checklistStatus.filter((c) => c.dueNow);
   const openIssues = issues.filter((i) => i.status !== "Klar");
-  const acuteIssues = openIssues.filter((i) => i.priority === "Akut");
   const openFelanmalan = orders.filter((o) => ids.has(o.propertyId) && o.type === "felanmalan" && o.status !== "Klar" && !o.cancelled);
   const openTillaggstjanst = orders.filter((o) => ids.has(o.propertyId) && o.type === "tillaggstjanst" && o.status !== "Klar" && !o.cancelled);
 
@@ -2431,7 +2429,7 @@ function Oversikt({ state, scopedProps, selectedProperty, selectedOrg, setTab, o
         <StatCard
           label="Öppna ärenden"
           value={openIssues.length}
-          tone={acuteIssues.length ? "warn" : "neutral"}
+          tone={openIssues.length ? "warn" : "neutral"}
           onClick={() => setTab("arenden")}
         />
         <StatCard
@@ -3482,11 +3480,46 @@ function ChecklistForm({ properties, onSubmit }) {
 
 /* ------------------------------ ärenden ------------------------------ */
 
+// Klickbar sektionsrubrik med utfällningspil, för listor med hanterade poster
+// som är dolda som standard och fälls ut vid behov (samma pil-logik som radvyerna).
+function CollapsibleSectionTitle({ label, count, open, onToggle, marginTop = 24 }) {
+  return (
+    <button
+      type="button"
+      className="fk-btn"
+      onClick={onToggle}
+      style={{
+        ...S.panelTitle,
+        margin: `${marginTop}px 0 ${open ? 10 : 0}px`,
+        display: "flex",
+        alignItems: "center",
+        gap: 8,
+        background: "transparent",
+        border: "none",
+        padding: 0,
+        cursor: "pointer",
+        width: "100%",
+        textAlign: "left",
+      }}
+    >
+      <span style={{ ...S.issueChevron, transform: open ? "rotate(90deg)" : "none" }}>▸</span>
+      {label}
+      <span style={{ fontWeight: 500, color: "#8a8578" }}>({count})</span>
+    </button>
+  );
+}
+
 function Arenden({ state, setState, scopedProps, actor, notify }) {
   const [showForm, setShowForm] = useState(false);
   // Vilket ärende som just nu klarmarkeras (då krävs en lösningskommentar).
   const [resolveTarget, setResolveTarget] = useState(null);
   const [resolveComment, setResolveComment] = useState("");
+  // Vilket ärende som just nu återöppnas (då krävs en orsak som loggas, samma
+  // logik som vid återöppning av period/order). reopenStatus minns vilken status
+  // ärendet ska tillbaka till (Öppen eller Pågår).
+  const [reopenTarget, setReopenTarget] = useState(null);
+  const [reopenStatus, setReopenStatus] = useState(null);
+  const [reopenReason, setReopenReason] = useState("");
   // Vilket ärende som just nu görs om till en felanmälan (skapar order + klarmarkerar).
   const [felanmalanTarget, setFelanmalanTarget] = useState(null);
   const [felanmalanNote, setFelanmalanNote] = useState("");
@@ -3502,6 +3535,8 @@ function Arenden({ state, setState, scopedProps, actor, notify }) {
       next.has(id) ? next.delete(id) : next.add(id);
       return next;
     });
+  // Hanterade ärenden är dolda som standard och fälls ut aktivt.
+  const [showDoneIssues, setShowDoneIssues] = useState(false);
 
   const ids = new Set(scopedProps.map((p) => p.id));
   const showPropertyTag = scopedProps.length > 1;
@@ -3530,31 +3565,57 @@ function Arenden({ state, setState, scopedProps, actor, notify }) {
   };
 
   // Statusbyte. Att sätta ett ärende till "Klar" kräver en lösningskommentar och
-  // går därför via klarmarkeringsrutan nedan. Övriga byten sker direkt och loggas.
+  // går via klarmarkeringsrutan. Att återöppna ett klart ärende kräver en orsak
+  // och går via återöppningsrutan. Övriga byten (Öppen ↔ Pågår) sker direkt.
   const setStatus = (issue, status) => {
     if (status === issue.status) return;
     if (status === "Klar") {
       setResolveTarget(issue.id);
       setResolveComment("");
+      setReopenTarget(null);
       setFelanmalanTarget(null);
       setExpanded((prev) => new Set(prev).add(issue.id));
       return;
     }
-    const wasKlar = issue.status === "Klar";
+    if (issue.status === "Klar") {
+      // Återöppning — kräver en orsak innan den genomförs.
+      setReopenTarget(issue.id);
+      setReopenStatus(status);
+      setReopenReason("");
+      setResolveTarget(null);
+      setFelanmalanTarget(null);
+      setExpanded((prev) => new Set(prev).add(issue.id));
+      return;
+    }
     const now = todayISO();
-    const entry = {
-      datum: now,
-      av: actor || "Okänd",
-      handelse: wasKlar ? "Återöppnad" : `Status ändrad till ${status}`,
-    };
+    const entry = { datum: now, av: actor || "Okänd", handelse: `Status ändrad till ${status}` };
     setState({
       ...state,
       issues: state.issues.map((i) =>
         i.id === issue.id ? { ...i, status, resolvedAt: null, logg: [...(i.logg || []), entry] } : i
       ),
     });
-    if (resolveTarget === issue.id) { setResolveTarget(null); setResolveComment(""); }
-    notify(wasKlar ? `${issue.title} återöppnad — loggat` : `${issue.title} → ${status}`);
+    notify(`${issue.title} → ${status}`);
+  };
+
+  // Genomför återöppningen när en orsak fyllts i. Orsaken sparas i loggen
+  // tillsammans med vem och när, precis som vid återöppning av period/order.
+  const confirmReopen = (issue) => {
+    const reason = reopenReason.trim();
+    if (!reason) return;
+    const now = todayISO();
+    const status = reopenStatus || "Öppen";
+    const entry = { datum: now, av: actor || "Okänd", handelse: "Återöppnad", kommentar: reason };
+    setState({
+      ...state,
+      issues: state.issues.map((i) =>
+        i.id === issue.id ? { ...i, status, resolvedAt: null, logg: [...(i.logg || []), entry] } : i
+      ),
+    });
+    setReopenTarget(null);
+    setReopenStatus(null);
+    setReopenReason("");
+    notify(`${issue.title} återöppnad — loggat`);
   };
 
   const confirmResolve = (issue) => {
@@ -3580,6 +3641,7 @@ function Arenden({ state, setState, scopedProps, actor, notify }) {
     setFelanmalanBil(false);
     setFelanmalanBilCount(1);
     setResolveTarget(null);
+    setReopenTarget(null);
     setExpanded((prev) => new Set(prev).add(issue.id));
   };
 
@@ -3643,7 +3705,7 @@ function Arenden({ state, setState, scopedProps, actor, notify }) {
           ...S.issueCard,
           ...(done
             ? { background: "#F5FBF6", borderColor: "#C3E4C6" }
-            : { borderColor: i.priority === "Akut" ? "#C4171C" : "#C9C4B7" }),
+            : { borderColor: "#C9C4B7" }),
         }}
       >
         {/* Kompakt rad — klicka för att fälla ut detaljer/logg. */}
@@ -3655,7 +3717,6 @@ function Arenden({ state, setState, scopedProps, actor, notify }) {
               {showPropertyTag && <span style={S.propertyTag}>{propName(i.propertyId)}</span>}
             </div>
             <div style={S.issueMeta}>
-              {i.priority === "Akut" && <span style={{ color: "#C4171C", fontWeight: 700 }}>Akut · </span>}
               Anmält {fmtDate(i.reportedAt)} av {i.reportedBy}
             </div>
           </div>
@@ -3678,10 +3739,7 @@ function Arenden({ state, setState, scopedProps, actor, notify }) {
               </div>
             )}
 
-            <div style={{ ...S.issueFooter, marginTop: 12 }}>
-              <span style={{ ...S.priorityTag, color: i.priority === "Akut" ? "#C4171C" : "#1C2321" }}>
-                {i.priority}
-              </span>
+            <div style={{ ...S.issueFooter, justifyContent: "flex-end", marginTop: 12 }}>
               <div style={S.statusRow}>
                 {STATUSES.map((s) => (
                   <button
@@ -3806,6 +3864,35 @@ function Arenden({ state, setState, scopedProps, actor, notify }) {
               </div>
             )}
 
+            {reopenTarget === i.id && (
+              <div style={{ marginTop: 10, padding: "10px 12px", border: "1px solid #C9C4B7", borderRadius: 8 }}>
+                <div style={{ ...S.rowSub, marginBottom: 6 }}>
+                  Ange varför ärendet öppnas igen — det sparas i loggen tillsammans med vem och när.
+                </div>
+                <textarea
+                  className="fk-input"
+                  style={{ ...S.input, height: 80, resize: "vertical" }}
+                  value={reopenReason}
+                  onChange={(e) => setReopenReason(e.target.value)}
+                  placeholder="t.ex. Felet kvarstår — behöver kompletteras"
+                  autoFocus
+                />
+                <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+                  <button
+                    style={{ ...S.primaryBtnSmall, opacity: reopenReason.trim() ? 1 : 0.5 }}
+                    className="fk-btn"
+                    disabled={!reopenReason.trim()}
+                    onClick={() => confirmReopen(i)}
+                  >
+                    Återöppna ärendet
+                  </button>
+                  <button style={S.linkBtn} className="fk-btn" onClick={() => { setReopenTarget(null); setReopenStatus(null); setReopenReason(""); }}>
+                    Avbryt
+                  </button>
+                </div>
+              </div>
+            )}
+
             {(i.logg || []).length > 0 && (
               <div style={{ ...S.rowSub, marginTop: 12, fontSize: 12 }}>
                 <div style={{ fontWeight: 600, marginBottom: 2 }}>Logg</div>
@@ -3847,8 +3934,15 @@ function Arenden({ state, setState, scopedProps, actor, notify }) {
 
           {doneIssues.length > 0 && (
             <>
-              <h3 style={{ ...S.panelTitle, marginTop: 24 }}>Klara ärenden</h3>
-              <div style={S.checklistStack}>{doneIssues.map((i) => renderCard(i, true))}</div>
+              <CollapsibleSectionTitle
+                label="Hanterade ärenden"
+                count={doneIssues.length}
+                open={showDoneIssues}
+                onToggle={() => setShowDoneIssues((s) => !s)}
+              />
+              {showDoneIssues && (
+                <div style={S.checklistStack}>{doneIssues.map((i) => renderCard(i, true))}</div>
+              )}
             </>
           )}
         </>
@@ -3860,13 +3954,12 @@ function Arenden({ state, setState, scopedProps, actor, notify }) {
 function IssueForm({ properties, onSubmit }) {
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
-  const [priority, setPriority] = useState("Normal");
   const [propertyId, setPropertyId] = useState(properties[0]?.id || "");
 
   const submit = (e) => {
     e.preventDefault();
     if (!title.trim() || !propertyId) return;
-    onSubmit({ title: title.trim(), description: description.trim(), propertyId, priority });
+    onSubmit({ title: title.trim(), description: description.trim(), propertyId });
   };
 
   return (
@@ -3877,16 +3970,6 @@ function IssueForm({ properties, onSubmit }) {
           <input className="fk-input" style={S.input} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="t.ex. Läckande diskmaskin" required />
         </label>
         <PropertyPicker properties={properties} value={propertyId} onChange={setPropertyId} />
-      </div>
-      <div style={S.formRow} className="fk-form-row">
-        <label style={S.label}>
-          Prioritet
-          <select className="fk-input" style={S.input} value={priority} onChange={(e) => setPriority(e.target.value)}>
-            {PRIORITIES.map((p) => (
-              <option key={p} value={p}>{p}</option>
-            ))}
-          </select>
-        </label>
       </div>
       <label style={S.label}>
         Beskrivning
@@ -4065,6 +4148,7 @@ function Debitering({ state, scopedProps, billing, notify }) {
   const [filterType, setFilterType] = useState("alla");
   const [filterCategory, setFilterCategory] = useState("alla");
   const [filterProperty, setFilterProperty] = useState("alla");
+  const [nyckeltalOpen, setNyckeltalOpen] = useState(false);
 
   const ids = new Set(scopedProps.map((p) => p.id));
   const showPropertyTag = scopedProps.length > 1;
@@ -4173,64 +4257,97 @@ function Debitering({ state, scopedProps, billing, notify }) {
         />
       )}
 
-      <div style={S.statGrid}>
-        <div style={S.statCard}>
-          <div style={{ ...S.statValue, color: "#3A413C" }}>{totalUnbilled}</div>
-          <div style={S.statLabel}>Ofakturerade timmar</div>
-        </div>
-        <div style={S.statCard}>
-          <div style={{ ...S.statValue, color: "#1C2321" }}>{totalUnbilledAmount.toLocaleString("sv-SE")} kr</div>
-          <div style={S.statLabel}>Ofakturerat belopp (ca)</div>
-        </div>
-        <div style={S.statCard}>
-          <div style={S.statValue}>{filteredOrders.length}</div>
-          <div style={S.statLabel}>Klarmarkerade ärenden</div>
-        </div>
-      </div>
-
       <div style={S.panel}>
-        <h3 style={S.panelTitle}>Debiteringsgrad{filterActive ? " — filtrerat urval" : " — föreningen totalt"}</h3>
-        <div style={S.kpiRow}>
-          <div style={S.kpiBlock}>
-            <div style={S.kpiValue}>{totalLogged}</div>
-            <div style={S.kpiLabel}>Totalt registrerad tid (h)</div>
-          </div>
-          <div style={S.kpiBlock}>
-            <div style={{ ...S.kpiValue, color: "#2B6E5E" }}>{totalInvoiced}</div>
-            <div style={S.kpiLabel}>Fakturerad tid (h)</div>
-          </div>
-          <div style={S.kpiBlock}>
-            <div style={{ ...S.kpiValue, color: "#C4171C" }}>{writtenOff}</div>
-            <div style={S.kpiLabel}>Debiterad men ej fakturerad tid (h)</div>
-          </div>
-          <div style={S.kpiBlock}>
-            <div style={{ ...S.kpiValue, color: "#3A413C" }}>
-              {debiteringsgrad === null ? "–" : `${debiteringsgrad}%`}
+        <button
+          type="button"
+          className="fk-btn"
+          onClick={() => setNyckeltalOpen((v) => !v)}
+          style={{
+            ...S.panelTitle,
+            margin: 0,
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            background: "transparent",
+            border: "none",
+            padding: 0,
+            cursor: "pointer",
+            width: "100%",
+            textAlign: "left",
+            fontSize: 16,
+          }}
+        >
+          <span style={{ ...S.issueChevron, transform: nyckeltalOpen ? "rotate(90deg)" : "none" }}>▸</span>
+          Nyckeltal
+        </button>
+
+        {nyckeltalOpen && (
+          <div style={{ marginTop: 14 }}>
+            {/* Grupp 1: översikt */}
+            <div style={{ ...S.statGrid, marginBottom: 0 }}>
+              <div style={S.statCard}>
+                <div style={{ ...S.statValue, color: "#3A413C" }}>{totalUnbilled}</div>
+                <div style={S.statLabel}>Ofakturerade timmar</div>
+              </div>
+              <div style={S.statCard}>
+                <div style={{ ...S.statValue, color: "#1C2321" }}>{totalUnbilledAmount.toLocaleString("sv-SE")} kr</div>
+                <div style={S.statLabel}>Ofakturerat belopp (ca)</div>
+              </div>
+              <div style={S.statCard}>
+                <div style={S.statValue}>{filteredOrders.length}</div>
+                <div style={S.statLabel}>Klarmarkerade ärenden</div>
+              </div>
             </div>
-            <div style={S.kpiLabel}>Debiteringsgrad</div>
-          </div>
-        </div>
 
-        <div style={S.kpiDivider} />
+            <div style={S.kpiDivider} />
 
-        <div style={S.kpiRow}>
-          <div style={S.kpiBlock}>
-            <div style={{ ...S.kpiValue, color: "#2B6E5E" }}>{invoicedAmountKr.toLocaleString("sv-SE")} kr</div>
-            <div style={S.kpiLabel}>Fakturerat belopp</div>
-          </div>
-          <div style={S.kpiBlock}>
-            <div style={{ ...S.kpiValue, color: "#C4171C" }}>{writtenOffAmountKr.toLocaleString("sv-SE")} kr</div>
-            <div style={S.kpiLabel}>Debiterbart men ej fakturerat belopp</div>
-          </div>
-          <div style={S.kpiBlock}>
-            <div style={{ ...S.kpiValue, color: "#1C2321" }}>{bilTotalKr.toLocaleString("sv-SE")} kr</div>
-            <div style={S.kpiLabel}>Totalt för Bil</div>
-          </div>
-        </div>
+            {/* Grupp 2: debiteringsgrad */}
+            <h4 style={{ ...S.panelTitle, fontSize: 13.5, margin: "0 0 12px" }}>
+              Debiteringsgrad{filterActive ? " — filtrerat urval" : " — föreningen totalt"}
+            </h4>
+            <div style={S.kpiRow}>
+              <div style={S.kpiBlock}>
+                <div style={S.kpiValue}>{totalLogged}</div>
+                <div style={S.kpiLabel}>Totalt registrerad tid (h)</div>
+              </div>
+              <div style={S.kpiBlock}>
+                <div style={{ ...S.kpiValue, color: "#2B6E5E" }}>{totalInvoiced}</div>
+                <div style={S.kpiLabel}>Fakturerad tid (h)</div>
+              </div>
+              <div style={S.kpiBlock}>
+                <div style={{ ...S.kpiValue, color: "#C4171C" }}>{writtenOff}</div>
+                <div style={S.kpiLabel}>Debiterad men ej fakturerad tid (h)</div>
+              </div>
+              <div style={S.kpiBlock}>
+                <div style={{ ...S.kpiValue, color: "#3A413C" }}>
+                  {debiteringsgrad === null ? "–" : `${debiteringsgrad}%`}
+                </div>
+                <div style={S.kpiLabel}>Debiteringsgrad</div>
+              </div>
+            </div>
 
-        {totalLogged === 0 && (
-          <div style={{ ...S.rowSub, marginTop: 10 }}>
-            Nyckeltalen fylls i allt eftersom faktureringsunderlag skapas nedan.
+            <div style={S.kpiDivider} />
+
+            <div style={S.kpiRow}>
+              <div style={S.kpiBlock}>
+                <div style={{ ...S.kpiValue, color: "#2B6E5E" }}>{invoicedAmountKr.toLocaleString("sv-SE")} kr</div>
+                <div style={S.kpiLabel}>Fakturerat belopp</div>
+              </div>
+              <div style={S.kpiBlock}>
+                <div style={{ ...S.kpiValue, color: "#C4171C" }}>{writtenOffAmountKr.toLocaleString("sv-SE")} kr</div>
+                <div style={S.kpiLabel}>Debiterbart men ej fakturerat belopp</div>
+              </div>
+              <div style={S.kpiBlock}>
+                <div style={{ ...S.kpiValue, color: "#1C2321" }}>{bilTotalKr.toLocaleString("sv-SE")} kr</div>
+                <div style={S.kpiLabel}>Totalt för Bil</div>
+              </div>
+            </div>
+
+            {totalLogged === 0 && (
+              <div style={{ ...S.rowSub, marginTop: 10 }}>
+                Nyckeltalen fylls i allt eftersom faktureringsunderlag skapas nedan.
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -4362,6 +4479,8 @@ function ArendeQueue({ type, title, newLabel, titleFieldLabel, titlePlaceholder,
       next.has(id) ? next.delete(id) : next.add(id);
       return next;
     });
+  // Hanterade ordrar är dolda som standard och fälls ut aktivt.
+  const [showHandled, setShowHandled] = useState(false);
   const [printingBasis, setPrintingBasis] = useState(null);
   const [sortBy, setSortBy] = useState("datum-senaste");
   const [filterCategory, setFilterCategory] = useState("alla");
@@ -4560,7 +4679,7 @@ function ArendeQueue({ type, title, newLabel, titleFieldLabel, titlePlaceholder,
         />
       )}
 
-      <h3 style={S.panelTitle}>Att hantera</h3>
+      <h3 style={S.panelTitle}>{title} att hantera</h3>
       {pending.length === 0 ? (
         <EmptyNote text={allOrdersForType.length > 0 ? "Inget att hantera just nu." : emptyText} />
       ) : (
@@ -4573,17 +4692,25 @@ function ArendeQueue({ type, title, newLabel, titleFieldLabel, titlePlaceholder,
         </div>
       )}
 
-      <h3 style={{ ...S.panelTitle, marginTop: 28 }}>Hanterade ordrar</h3>
-      {handled.length === 0 ? (
-        <EmptyNote text="Inga hanterade ordrar ännu — hamnar här när de skickas till Debitering eller makuleras." />
-      ) : (
-        <div style={S.checklistStack}>
-          {sortOrders(handled, sortBy, (o) => ({
-            date: o.cancelled ? o.cancelledAt : o.completedAt,
-            hours: billing.loggedHours(o.id),
-            amount: billing.loggedHours(o.id) * billing.rateFor(o),
-          })).map(orderRow)}
-        </div>
+      {handled.length > 0 && (
+        <>
+          <CollapsibleSectionTitle
+            label={`Hanterade ${title}`}
+            count={handled.length}
+            open={showHandled}
+            onToggle={() => setShowHandled((s) => !s)}
+            marginTop={28}
+          />
+          {showHandled && (
+            <div style={S.checklistStack}>
+              {sortOrders(handled, sortBy, (o) => ({
+                date: o.cancelled ? o.cancelledAt : o.completedAt,
+                hours: billing.loggedHours(o.id),
+                amount: billing.loggedHours(o.id) * billing.rateFor(o),
+              })).map(orderRow)}
+            </div>
+          )}
+        </>
       )}
     </div>
   );
@@ -7990,7 +8117,6 @@ const S = {
   historyRow: { fontSize: 11.5, color: "#8a8578", marginTop: 10 },
 
   issueFooter: { display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 12, flexWrap: "wrap", gap: 8 },
-  priorityTag: { fontSize: 12, fontWeight: 700, fontFamily: "'IBM Plex Mono', monospace" },
   issueCard: { background: "#FFFFFF", border: "1.5px solid #C9C4B7", borderRadius: 8, padding: "10px 12px" },
   issueRow: { display: "flex", alignItems: "center", gap: 10, cursor: "pointer" },
   issueChevron: { fontSize: 12, color: "#8a8578", transition: "transform .15s ease", width: 12, flexShrink: 0 },

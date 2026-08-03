@@ -1411,6 +1411,10 @@ function AuthenticatedApp({ session }) {
         .fk-tab-btn:focus-visible, .fk-btn:focus-visible, .fk-input:focus-visible { outline: 2px solid #3A413C; outline-offset: 2px; }
         @media (max-width: 640px) {
           input, select, textarea { font-size: 16px !important; }
+          /* På mobil staplas formulärfälten under varandra i stället för att
+             trängas två-och-två. Framför allt Datum + Timmar i tidrader blev
+             tokiga sida vid sida eftersom iOS ritar datumfältet brett. */
+          .fk-form-row { grid-template-columns: 1fr !important; }
         }
         @media print {
           body * { visibility: hidden; }
@@ -1978,6 +1982,189 @@ function OrganizationForm({ initial, onSubmit, onCancel }) {
   );
 }
 
+/* ------------------------------------------------------------------ */
+/*  Föreningsdokument — avtal, ritningar m.m. lagrade i Supabase       */
+/*  Storage. Storage är källan till sanning: vi listar filerna live,   */
+/*  så inget behöver sparas i den delade app-staten och allt syncar    */
+/*  automatiskt mellan mobil och dator. Bucketen "foreningsdokument"   */
+/*  måste finnas (skapas i Supabase-dashboarden) och vara privat —     */
+/*  filerna öppnas via tidsbegränsade signerade länkar.                */
+/* ------------------------------------------------------------------ */
+const DOCS_BUCKET = "foreningsdokument";
+const DOC_ACCEPT = ".pdf,image/png,image/jpeg";
+const MAX_DOC_MB = 25;
+
+function OrgDocuments({ orgId }) {
+  const [files, setFiles] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [confirmDel, setConfirmDel] = useState(null);
+  const inputRef = useRef(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    try {
+      const { data, error } = await supabase.storage
+        .from(DOCS_BUCKET)
+        .list(orgId, { limit: 200, sortBy: { column: "created_at", order: "desc" } });
+      if (error) throw error;
+      // Storage kan returnera en platshållarrad utan id — filtrera bort den.
+      setFiles((data || []).filter((f) => f.name && f.id !== null));
+    } catch (e) {
+      setError(e.message || "Kunde inte hämta dokument");
+    } finally {
+      setLoading(false);
+    }
+  }, [orgId]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  // Filnamn lagras som "{tidsstämpel}__{originalnamn}" för att undvika krockar.
+  const displayName = (name) => {
+    const i = name.indexOf("__");
+    return i >= 0 ? name.slice(i + 2) : name;
+  };
+
+  const upload = async (file) => {
+    if (!file) return;
+    setError("");
+    if (file.size > MAX_DOC_MB * 1024 * 1024) {
+      setError(`Filen är för stor (max ${MAX_DOC_MB} MB).`);
+      return;
+    }
+    const okType =
+      file.type === "application/pdf" || file.type === "image/png" || file.type === "image/jpeg";
+    if (!okType) {
+      setError("Endast PDF, JPG och PNG stöds.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const safe = file.name.replace(/[^\w.\-() åäöÅÄÖ]/g, "_");
+      const path = `${orgId}/${Date.now()}__${safe}`;
+      const { error } = await supabase.storage
+        .from(DOCS_BUCKET)
+        .upload(path, file, { contentType: file.type, upsert: false });
+      if (error) throw error;
+      await load();
+    } catch (e) {
+      setError(e.message || "Uppladdning misslyckades");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const open = async (name) => {
+    setError("");
+    try {
+      const { data, error } = await supabase.storage
+        .from(DOCS_BUCKET)
+        .createSignedUrl(`${orgId}/${name}`, 60);
+      if (error) throw error;
+      window.open(data.signedUrl, "_blank", "noopener");
+    } catch (e) {
+      setError(e.message || "Kunde inte öppna filen");
+    }
+  };
+
+  const remove = async (name) => {
+    setBusy(true);
+    setError("");
+    try {
+      const { error } = await supabase.storage.from(DOCS_BUCKET).remove([`${orgId}/${name}`]);
+      if (error) throw error;
+      setConfirmDel(null);
+      await load();
+    } catch (e) {
+      setError(e.message || "Kunde inte ta bort filen");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const fmtSize = (b) => {
+    if (b == null) return "";
+    if (b < 1024) return `${b} B`;
+    if (b < 1024 * 1024) return `${Math.round(b / 1024)} kB`;
+    return `${(b / (1024 * 1024)).toFixed(1)} MB`;
+  };
+
+  const isPdf = (name, mt) => (mt || "").includes("pdf") || name.toLowerCase().endsWith(".pdf");
+
+  return (
+    <div style={S.runBox}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+        <span style={{ ...S.rowSub, fontWeight: 600, color: "#1C2321" }}>Dokument (avtal m.m.)</span>
+        <button
+          type="button"
+          style={S.secondaryBtnSmall}
+          className="fk-btn"
+          disabled={busy}
+          onClick={() => inputRef.current?.click()}
+        >
+          {busy ? "Laddar…" : "Ladda upp PDF/bild"}
+        </button>
+        <input
+          ref={inputRef}
+          type="file"
+          accept={DOC_ACCEPT}
+          style={{ display: "none" }}
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            e.target.value = "";
+            upload(f);
+          }}
+        />
+      </div>
+
+      {error && <div style={{ ...S.rowSub, color: "#C4171C", marginTop: 8 }}>{error}</div>}
+
+      <div style={{ marginTop: 10 }}>
+        {loading ? (
+          <div style={S.rowSub}>Hämtar dokument…</div>
+        ) : files.length === 0 ? (
+          <div style={S.rowSub}>
+            Inga dokument uppladdade ännu. Lägg t.ex. avtal här så finns de nära till hands ute på fält.
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {files.map((f) => (
+              <div key={f.name} style={S.docRow}>
+                <span style={S.docIcon}>{isPdf(f.name, f.metadata?.mimetype) ? "PDF" : "BILD"}</span>
+                <button type="button" style={S.docNameBtn} className="fk-btn" onClick={() => open(f.name)} title="Öppna">
+                  {displayName(f.name)}
+                </button>
+                <span style={S.docMeta}>
+                  {f.created_at ? fmtDate(f.created_at.slice(0, 10)) : ""}
+                  {f.metadata?.size != null ? ` · ${fmtSize(f.metadata.size)}` : ""}
+                </span>
+                {confirmDel === f.name ? (
+                  <span style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                    <button type="button" style={{ ...S.docDelBtn, color: "#C4171C", fontWeight: 700 }} onClick={() => remove(f.name)}>
+                      Ta bort
+                    </button>
+                    <button type="button" style={S.docDelBtn} onClick={() => setConfirmDel(null)}>
+                      Avbryt
+                    </button>
+                  </span>
+                ) : (
+                  <button type="button" style={S.docDelBtn} onClick={() => setConfirmDel(f.name)} aria-label="Ta bort dokument">
+                    ×
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function Oversikt({ state, scopedProps, selectedProperty, selectedOrg, setTab, onEditOrg, onRemoveOrg }) {
   const ids = new Set(scopedProps.map((p) => p.id));
   const issues = state.issues.filter((i) => ids.has(i.propertyId));
@@ -2178,52 +2365,61 @@ function Oversikt({ state, scopedProps, selectedProperty, selectedOrg, setTab, o
               )}
             </div>
           )}
+
+          <OrgDocuments orgId={selectedOrg.id} />
         </div>
       )}
 
       {!selectedOrg && (
         <div style={{ ...S.panel, marginBottom: 18 }}>
           <h2 style={{ ...S.h2, marginBottom: 4 }}>Alla föreningar</h2>
-          <div style={{ ...S.rowSub, marginBottom: 14 }}>
-            Sammanställning över samtliga {scopedProps.length} föreningar. Välj en förening i listan högst upp för att se och redigera detaljerna.
+          <div style={{ ...S.rowSub, marginBottom: 12 }}>
+            Sammanställning över samtliga {scopedProps.length} föreningar. Välj en förening i listan högst upp för att se enbart den.
           </div>
           {scopedProps.length === 0 ? (
             <EmptyNote text="Inga föreningar ännu." />
           ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-              {scopedProps.map((p) => {
-                const pDue = checklistStatus.filter((c) => c.template.propertyId === p.id && c.dueNow).length;
-                const pOpenIssues = issues.filter((i) => i.propertyId === p.id && i.status !== "Klar").length;
-                const pOpenFelanmalan = openFelanmalan.filter((o) => o.propertyId === p.id).length;
-                const pOpenTillaggstjanst = openTillaggstjanst.filter((o) => o.propertyId === p.id).length;
-                const chips = [
-                  { label: "Att pricka av", value: pDue, warn: true },
-                  { label: "Öppna ärenden", value: pOpenIssues },
-                  { label: "Öppna felanmälningar", value: pOpenFelanmalan },
-                  { label: "Öppna tilläggstjänster", value: pOpenTillaggstjanst },
-                ];
-                return (
-                  <div key={p.id} style={S.summaryCard}>
-                    <div style={S.summaryCardName}>{p.name}</div>
-                    <div style={S.summaryChips}>
-                      {chips.map((c) => (
-                        <div key={c.label} style={S.summaryChip}>
-                          <span
-                            style={{
-                              ...S.summaryChipValue,
-                              color: c.value > 0 ? (c.warn ? "#C4171C" : "#1C2321") : "#9BA39C",
-                            }}
-                          >
-                            {c.value}
-                          </span>
-                          <span style={S.summaryChipLabel}>{c.label}</span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
+            <table style={S.matrix}>
+              <colgroup>
+                <col style={{ width: "32%" }} />
+                <col style={{ width: "17%" }} />
+                <col style={{ width: "17%" }} />
+                <col style={{ width: "17%" }} />
+                <col style={{ width: "17%" }} />
+              </colgroup>
+              <thead>
+                <tr>
+                  <th style={{ ...S.matrixTh, textAlign: "left" }}>Förening</th>
+                  <th style={S.matrixTh}>Pricka av</th>
+                  <th style={S.matrixTh}>Ärenden</th>
+                  <th style={S.matrixTh}>Felanm.</th>
+                  <th style={S.matrixTh}>Tillägg</th>
+                </tr>
+              </thead>
+              <tbody>
+                {scopedProps.map((p) => {
+                  const pDue = checklistStatus.filter((c) => c.template.propertyId === p.id && c.dueNow).length;
+                  const pOpenIssues = issues.filter((i) => i.propertyId === p.id && i.status !== "Klar").length;
+                  const pOpenFelanmalan = openFelanmalan.filter((o) => o.propertyId === p.id).length;
+                  const pOpenTillaggstjanst = openTillaggstjanst.filter((o) => o.propertyId === p.id).length;
+                  const cell = (v, warn) => ({
+                    ...S.matrixTd,
+                    textAlign: "center",
+                    color: v > 0 ? (warn ? "#C4171C" : "#1C2321") : "#9BA39C",
+                    fontWeight: v > 0 ? 700 : 400,
+                  });
+                  return (
+                    <tr key={p.id}>
+                      <td style={{ ...S.matrixTd, textAlign: "left", fontWeight: 600 }}>{p.name}</td>
+                      <td style={cell(pDue, true)}>{pDue}</td>
+                      <td style={cell(pOpenIssues, false)}>{pOpenIssues}</td>
+                      <td style={cell(pOpenFelanmalan, true)}>{pOpenFelanmalan}</td>
+                      <td style={cell(pOpenTillaggstjanst, false)}>{pOpenTillaggstjanst}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
           )}
         </div>
       )}
@@ -4199,6 +4395,14 @@ function KallaRad({ order }) {
 function ArendeQueue({ type, title, newLabel, titleFieldLabel, titlePlaceholder, emptyText, state, scopedProps, billing, notify }) {
   const [showForm, setShowForm] = useState(false);
   const [openOrderId, setOpenOrderId] = useState(null);
+  // Vilka orderkort som är utfällda i listan (kompakt vy, som Ärenden-fliken).
+  const [expandedRows, setExpandedRows] = useState(() => new Set());
+  const toggleRow = (id) =>
+    setExpandedRows((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
   const [printingBasis, setPrintingBasis] = useState(null);
   const [sortBy, setSortBy] = useState("datum-senaste");
   const [filterCategory, setFilterCategory] = useState("alla");
@@ -4285,99 +4489,82 @@ function ArendeQueue({ type, title, newLabel, titleFieldLabel, titlePlaceholder,
     );
   }
 
+  // Statuspiller för orderlistan — samma färglogik som Ärenden-flikens pill.
+  const ORDER_STATUS_PILL = {
+    "Pågår": { background: "#C49A2A", color: "#FFFFFF", borderColor: "#C49A2A" },
+    "Klar": { background: "#2B6E5E", color: "#FFFFFF", borderColor: "#2B6E5E" },
+    "Makulerad": { background: "#C4171C", color: "#FFFFFF", borderColor: "#C4171C" },
+  };
+
+  // Kompakt, utfällbart orderkort — samma stil som Ärenden-fliken.
+  // Klick på raden fäller ut detaljer, åtgärder och loggade timmar.
   const orderRow = (o) => {
     const logged = billing.loggedHours(o.id);
+    const isOpen = expandedRows.has(o.id);
+    const statusLabel = o.cancelled ? "Makulerad" : o.status === "Klar" ? "Klar" : "Pågår";
+    const cardTint = o.cancelled
+      ? { background: "#FEF6F5", borderColor: "#F0C7C4" }
+      : o.status === "Klar"
+      ? { background: "#F5FBF6", borderColor: "#C3E4C6" }
+      : {};
 
-    if (o.cancelled) {
-      return (
-        <div key={o.id} style={S.checklistCardCancelled}>
-          <div style={S.checklistHead}>
-            <div>
-              <div style={S.taskCardTitle}>
-                <span style={S.orderNumberTag}>#{o.orderNumber}</span> {o.title}
-                <span style={{ ...S.typeTag, color: "#C4171C", background: "#FDEDEC", borderColor: "#F0B8B8" }}>Makulerad</span>
-                {showPropertyTag && <span style={S.propertyTag}>{propName(o.propertyId)}</span>}
-              </div>
-              <div style={S.taskCardProp}>
-                Inkom {fmtDate(o.reportedDate)} · makulerad {fmtDate(o.cancelledAt)} av {o.cancelledBy}
-              </div>
-              {type === "felanmalan" && <KallaRad order={o} />}
-              <div style={{ ...S.rowSub, marginTop: 6 }}>Orsak: {o.cancelledReason}</div>
-            </div>
-            <button style={S.stampBtn} className="fk-btn" onClick={() => setOpenOrderId(o.id)}>
-              Visa
-            </button>
-          </div>
-        </div>
-      );
-    }
-
-    if (o.status === "Klar") {
-      return (
-        <div key={o.id} style={S.checklistCardInvoiced}>
-          <div style={S.checklistHead}>
-            <div>
-              <div style={S.taskCardTitle}>
-                <span style={S.orderNumberTag}>#{o.orderNumber}</span> {o.title}
-                <span style={S.typeTag}>Skickad till Debitering</span>
-                {showPropertyTag && <span style={S.propertyTag}>{propName(o.propertyId)}</span>}
-              </div>
-              <div style={S.taskCardProp}>
-                Inkom {fmtDate(o.reportedDate)} · klarmarkerad {fmtDate(o.completedAt)}
-              </div>
-              {type === "felanmalan" && <KallaRad order={o} />}
-            </div>
-            <button style={S.stampBtn} className="fk-btn" onClick={() => setOpenOrderId(o.id)}>
-              Visa
-            </button>
-          </div>
-          <div style={S.issueFooter}>
-            <span style={S.rowSub}>
-              {logged} h loggat{o.priceCategory ? ` · ${o.priceCategory} (${billing.rateFor(o)} kr/h)` : ""}
-              {o.billCount > 0 && ` · Bil ${o.billCount} st`}
-            </span>
-          </div>
-        </div>
-      );
-    }
+    const meta = o.cancelled
+      ? `Inkom ${fmtDate(o.reportedDate)} · makulerad ${fmtDate(o.cancelledAt)} av ${o.cancelledBy}`
+      : o.status === "Klar"
+      ? `Inkom ${fmtDate(o.reportedDate)} · klarmarkerad ${fmtDate(o.completedAt)}`
+      : `Inkom ${fmtDate(o.reportedDate)}${logged ? ` · ${logged} h loggat` : ""}`;
 
     return (
-      <div key={o.id} style={S.checklistCardPending}>
-        <div style={S.checklistHead}>
-          <div>
-            <div style={S.taskCardTitle}>
+      <div key={o.id} style={{ ...S.issueCard, ...cardTint }}>
+        {/* Kompakt rad — klicka för att fälla ut detaljer och åtgärder. */}
+        <div style={S.issueRow} onClick={() => toggleRow(o.id)}>
+          <span style={{ ...S.issueChevron, transform: isOpen ? "rotate(90deg)" : "none" }}>▸</span>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={S.issueTitle}>
               <span style={S.orderNumberTag}>#{o.orderNumber}</span> {o.title}
               {showPropertyTag && <span style={S.propertyTag}>{propName(o.propertyId)}</span>}
             </div>
-            <div style={S.taskCardProp}>Inkom {fmtDate(o.reportedDate)}</div>
+            <div style={S.issueMeta}>{meta}</div>
+          </div>
+          <span style={{ ...S.statusPill, ...ORDER_STATUS_PILL[statusLabel], whiteSpace: "nowrap" }}>
+            {statusLabel}
+          </span>
+        </div>
+
+        {isOpen && (
+          <div style={S.issueDetails}>
             {o.reporterAddress && (
-              <div style={{ ...S.rowSub, marginTop: 4 }}>
+              <div style={{ ...S.rowSub, marginTop: 0 }}>
                 <strong style={{ color: "#1C2321" }}>Adress:</strong> {o.reporterAddress}
               </div>
             )}
             {o.description && <div style={{ ...S.rowSub, marginTop: 6 }}>{o.description}</div>}
             {type === "felanmalan" && <KallaRad order={o} />}
-          </div>
-        </div>
+            {o.cancelled && (
+              <div style={{ ...S.rowSub, marginTop: 6 }}>Orsak: {o.cancelledReason}</div>
+            )}
 
-        <div style={S.issueFooter}>
-          <span style={S.rowSub}>
-            {logged} h loggat{o.priceCategory ? ` · ${o.priceCategory} (${billing.rateFor(o)} kr/h)` : ""}
-            {o.billCount > 0 && ` · Bil ${o.billCount} st`}
-          </span>
-          <div style={{ display: "flex", gap: 8 }}>
-            <button style={S.stampBtn} className="fk-btn" onClick={() => setOpenOrderId(o.id)}>
-              Öppna
-            </button>
-            <button
-              style={S.primaryBtnSmall}
-              className="fk-btn"
-              onClick={() => billing.setOrderStatus(o, "Klar")}
-            >
-              Markera klar
-            </button>
+            <div style={{ ...S.rowSub, marginTop: 8 }}>
+              {logged} h loggat{o.priceCategory ? ` · ${o.priceCategory} (${billing.rateFor(o)} kr/h)` : ""}
+              {o.billCount > 0 && ` · Bil ${o.billCount} st`}
+            </div>
+
+            <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+              <button style={S.stampBtn} className="fk-btn" onClick={() => setOpenOrderId(o.id)}>
+                {o.cancelled || o.status === "Klar" ? "Visa" : "Öppna"}
+              </button>
+              {!o.cancelled && o.status !== "Klar" && (
+                <button
+                  style={S.primaryBtnSmall}
+                  className="fk-btn"
+                  onClick={() => billing.setOrderStatus(o, "Klar")}
+                >
+                  Markera klar
+                </button>
+              )}
+            </div>
           </div>
-        </div>
+        )}
       </div>
     );
   };
@@ -7888,6 +8075,11 @@ const S = {
   linkDangerBtn: { background: "transparent", border: "none", color: "#C4171C", fontSize: 12.5, fontWeight: 600, padding: "0 4px" },
   checklistHead: { display: "flex", justifyContent: "space-between", gap: 10 },
   runBox: { marginTop: 12, paddingTop: 12, borderTop: "1px dashed #C9C4B7", display: "flex", flexDirection: "column", gap: 8 },
+  docRow: { display: "flex", alignItems: "center", gap: 8, padding: "7px 9px", background: "#FBFAF7", border: "1px solid #E4E0D5", borderRadius: 6 },
+  docIcon: { flexShrink: 0, fontFamily: "'Oswald', sans-serif", fontSize: 10, fontWeight: 600, letterSpacing: 0.5, color: "#5C594E", background: "#EDEAE1", border: "1px solid #D9D4C7", borderRadius: 4, padding: "3px 6px" },
+  docNameBtn: { flex: 1, minWidth: 0, textAlign: "left", background: "transparent", border: "none", padding: 0, color: "#2B6E5E", fontSize: 13.5, fontWeight: 600, textDecoration: "underline", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
+  docMeta: { flexShrink: 0, fontSize: 11.5, color: "#8a8578", whiteSpace: "nowrap" },
+  docDelBtn: { flexShrink: 0, background: "transparent", border: "none", color: "#8a8578", fontSize: 13, padding: "2px 6px", borderRadius: 4 },
   checkRow: { display: "flex", alignItems: "center", gap: 8, fontSize: 13.5 },
   checkbox: { width: 16, height: 16, accentColor: "#2B6E5E" },
   runFooter: { display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 6 },
@@ -7930,6 +8122,29 @@ const S = {
   summaryCard: { border: "1px solid #E4E0D6", borderRadius: 8, padding: "12px 14px", background: "#FBFAF7" },
   summaryCardName: { fontFamily: "'Oswald', sans-serif", fontSize: 16, fontWeight: 600, marginBottom: 8 },
   summaryChips: { display: "flex", flexWrap: "wrap", gap: 8 },
+  summaryRow: { display: "flex", flexDirection: "column", gap: 2, padding: "9px 0" },
+  summaryRowName: { fontSize: 15, fontWeight: 600 },
+  summaryRowMeta: { fontSize: 12.5, color: "#5C594E", lineHeight: 1.5 },
+  matrix: { width: "100%", borderCollapse: "collapse", tableLayout: "fixed", fontSize: 12 },
+  matrixTh: {
+    padding: "4px 3px",
+    fontSize: 10,
+    textTransform: "uppercase",
+    letterSpacing: 0.2,
+    color: "#5C594E",
+    borderBottom: "1.5px solid #1C2321",
+    verticalAlign: "bottom",
+    textAlign: "center",
+    lineHeight: 1.2,
+    wordBreak: "break-word",
+  },
+  matrixTd: {
+    padding: "10px 3px",
+    borderBottom: "1px solid #E4E0D6",
+    fontSize: 13,
+    verticalAlign: "middle",
+    wordBreak: "break-word",
+  },
   summaryChip: { display: "flex", alignItems: "baseline", gap: 6, background: "#FFFFFF", border: "1px solid #E4E0D6", borderRadius: 6, padding: "6px 10px" },
   summaryChipValue: { fontFamily: "'IBM Plex Mono', monospace", fontSize: 16, fontWeight: 600 },
   summaryChipLabel: { fontSize: 12, color: "#5C594E" },

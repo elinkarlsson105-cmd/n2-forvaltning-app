@@ -1747,7 +1747,7 @@ function OrganizationForm({ initial, onSubmit, onCancel }) {
 
   return (
     <form onSubmit={submit} style={S.formPanel}>
-      <div style={S.formRow}>
+      <div style={S.formRow} className="fk-form-row">
         <label style={S.label}>
           Föreningens namn
           <input className="fk-input" style={S.input} value={name} onChange={(e) => setName(e.target.value)} placeholder="t.ex. BRF Solrosen" required />
@@ -1790,7 +1790,7 @@ function OrganizationForm({ initial, onSubmit, onCancel }) {
           Vart driftrapporten går och hur ofta den ska lämnas. Avvikelser som upptäcks
           däremellan syns för dig i Driftrapporter — styrelsen behöver inte få dem varje månad.
         </div>
-        <div style={S.formRow}>
+        <div style={S.formRow} className="fk-form-row">
           <label style={S.label}>
             E-post till styrelsen
             <input className="fk-input" style={S.input} type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="styrelsen@brfsolrosen.se" />
@@ -1816,7 +1816,7 @@ function OrganizationForm({ initial, onSubmit, onCancel }) {
           Priserna hämtas härifrån när du prissätter tilläggstjänster och felanmälningar
           i Debitering. Ändrar du dem gäller de framåt — redan skapade underlag räknas inte om.
         </div>
-        <div style={S.formRow}>
+        <div style={S.formRow} className="fk-form-row">
           <label style={S.label}>
             Timpris FA (kr/h)
             <input className="fk-input" style={S.input} inputMode="numeric" value={faRate} onChange={(e) => setFaRate(e.target.value)} placeholder="0" />
@@ -1872,7 +1872,7 @@ function OrganizationForm({ initial, onSubmit, onCancel }) {
           Referensvärden som sällan ändras. De används som nämnare i nyckeltalen: kWh/m² och m³/m²
           mot Atemp, och liter per person och dygn mot antal boende.
         </div>
-        <div style={S.formRow}>
+        <div style={S.formRow} className="fk-form-row">
           <label style={S.label}>
             BOA — boarea (m²)
             <input className="fk-input" style={S.input} type="number" step="1" min="0" value={boa} onChange={(e) => setBoa(e.target.value)} />
@@ -1886,7 +1886,7 @@ function OrganizationForm({ initial, onSubmit, onCancel }) {
           <input type="checkbox" checked={atempMode === "beraknad"} onChange={(e) => setAtempMode(e.target.checked ? "beraknad" : "manual")} />
           Räkna ut Atemp automatiskt från BOA + LOA (≈ 1,25 × (BOA + LOA))
         </label>
-        <div style={S.formRow}>
+        <div style={S.formRow} className="fk-form-row">
           <label style={{ ...S.label, opacity: atempMode === "beraknad" ? 0.45 : 1 }}>
             Atemp — manuellt (m²)
             <input
@@ -1912,7 +1912,7 @@ function OrganizationForm({ initial, onSubmit, onCancel }) {
             />
           </label>
         </div>
-        <div style={S.formRow}>
+        <div style={S.formRow} className="fk-form-row">
           <label style={S.label}>
             Antal lägenheter
             <input className="fk-input" style={S.input} type="number" step="1" min="0" value={antalLgh} onChange={(e) => setAntalLgh(e.target.value)} />
@@ -1936,7 +1936,7 @@ function OrganizationForm({ initial, onSubmit, onCancel }) {
           <input type="checkbox" checked={vvAuto} onChange={(e) => setVvAuto(e.target.checked)} />
           Skatta varmvattnet automatiskt från sommarmånaderna (juni–augusti)
         </label>
-        <div style={S.formRow}>
+        <div style={S.formRow} className="fk-form-row">
           <label style={S.label}>
             {vvAuto ? "Bastal som reserv (MWh/månad, valfritt)" : "Bastal varmvatten (MWh/månad)"}
             <input
@@ -2183,42 +2183,46 @@ function Oversikt({ state, scopedProps, selectedProperty, selectedOrg, setTab, o
 
       {!selectedOrg && (
         <div style={{ ...S.panel, marginBottom: 18 }}>
-          <h2 style={{ ...S.h2, marginBottom: 4 }}>Alla fastigheter</h2>
+          <h2 style={{ ...S.h2, marginBottom: 4 }}>Alla föreningar</h2>
           <div style={{ ...S.rowSub, marginBottom: 14 }}>
-            Sammanställning över samtliga {scopedProps.length} fastigheter. Välj en förening eller en enskild fastighet i listan högst upp för att se och redigera detaljerna.
+            Sammanställning över samtliga {scopedProps.length} föreningar. Välj en förening i listan högst upp för att se och redigera detaljerna.
           </div>
           {scopedProps.length === 0 ? (
-            <EmptyNote text="Inga fastigheter ännu." />
+            <EmptyNote text="Inga föreningar ännu." />
           ) : (
-            <div style={{ overflowX: "auto" }}>
-              <table style={S.summaryTable}>
-                <thead>
-                  <tr>
-                    <th style={S.summaryTh}>Förening</th>
-                    <th style={S.summaryTh}>Att pricka av</th>
-                    <th style={S.summaryTh}>Öppna ärenden</th>
-                    <th style={S.summaryTh}>Öppna felanmälningar</th>
-                    <th style={S.summaryTh}>Öppna tilläggstjänster</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {scopedProps.map((p) => {
-                    const pDue = checklistStatus.filter((c) => c.template.propertyId === p.id && c.dueNow).length;
-                    const pOpenIssues = issues.filter((i) => i.propertyId === p.id && i.status !== "Klar").length;
-                    const pOpenFelanmalan = openFelanmalan.filter((o) => o.propertyId === p.id).length;
-                    const pOpenTillaggstjanst = openTillaggstjanst.filter((o) => o.propertyId === p.id).length;
-                    return (
-                      <tr key={p.id}>
-                        <td style={S.summaryTd}>{p.name}</td>
-                        <td style={{ ...S.summaryTd, color: pDue ? "#C4171C" : "#5C594E" }}>{pDue}</td>
-                        <td style={{ ...S.summaryTd, color: pOpenIssues ? "#3A413C" : "#5C594E" }}>{pOpenIssues}</td>
-                        <td style={{ ...S.summaryTd, color: pOpenFelanmalan ? "#3A413C" : "#5C594E" }}>{pOpenFelanmalan}</td>
-                        <td style={{ ...S.summaryTd, color: pOpenTillaggstjanst ? "#3A413C" : "#5C594E" }}>{pOpenTillaggstjanst}</td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {scopedProps.map((p) => {
+                const pDue = checklistStatus.filter((c) => c.template.propertyId === p.id && c.dueNow).length;
+                const pOpenIssues = issues.filter((i) => i.propertyId === p.id && i.status !== "Klar").length;
+                const pOpenFelanmalan = openFelanmalan.filter((o) => o.propertyId === p.id).length;
+                const pOpenTillaggstjanst = openTillaggstjanst.filter((o) => o.propertyId === p.id).length;
+                const chips = [
+                  { label: "Att pricka av", value: pDue, warn: true },
+                  { label: "Öppna ärenden", value: pOpenIssues },
+                  { label: "Öppna felanmälningar", value: pOpenFelanmalan },
+                  { label: "Öppna tilläggstjänster", value: pOpenTillaggstjanst },
+                ];
+                return (
+                  <div key={p.id} style={S.summaryCard}>
+                    <div style={S.summaryCardName}>{p.name}</div>
+                    <div style={S.summaryChips}>
+                      {chips.map((c) => (
+                        <div key={c.label} style={S.summaryChip}>
+                          <span
+                            style={{
+                              ...S.summaryChipValue,
+                              color: c.value > 0 ? (c.warn ? "#C4171C" : "#1C2321") : "#9BA39C",
+                            }}
+                          >
+                            {c.value}
+                          </span>
+                          <span style={S.summaryChipLabel}>{c.label}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>
@@ -2450,7 +2454,7 @@ function TaskForm({ properties, onSubmit }) {
 
   return (
     <form onSubmit={submit} style={S.formPanel}>
-      <div style={S.formRow}>
+      <div style={S.formRow} className="fk-form-row">
         <label style={S.label}>
           Uppgift
           <input
@@ -2464,7 +2468,7 @@ function TaskForm({ properties, onSubmit }) {
         </label>
         <PropertyPicker properties={properties} value={propertyId} onChange={setPropertyId} />
       </div>
-      <div style={S.formRow}>
+      <div style={S.formRow} className="fk-form-row">
         <label style={S.label}>
           Kategori
           <select className="fk-input" style={S.input} value={category} onChange={(e) => setCategory(e.target.value)}>
@@ -3227,7 +3231,7 @@ function ChecklistForm({ properties, onSubmit }) {
 
   return (
     <form onSubmit={submit} style={S.formPanel}>
-      <div style={S.formRow}>
+      <div style={S.formRow} className="fk-form-row">
         <label style={S.label}>
           Namn på checklista
           <input className="fk-input" style={S.input} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="t.ex. Veckokontroll källare" required />
@@ -3266,7 +3270,7 @@ function ChecklistForm({ properties, onSubmit }) {
         </span>
       </label>
 
-      <div style={S.formRow}>
+      <div style={S.formRow} className="fk-form-row">
         {dagsberoende ? (
           <label style={S.label}>
             Antal dagar mellan kontroller
@@ -3712,14 +3716,14 @@ function IssueForm({ properties, onSubmit }) {
 
   return (
     <form onSubmit={submit} style={S.formPanel}>
-      <div style={S.formRow}>
+      <div style={S.formRow} className="fk-form-row">
         <label style={S.label}>
           Vad är felet?
           <input className="fk-input" style={S.input} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="t.ex. Läckande diskmaskin" required />
         </label>
         <PropertyPicker properties={properties} value={propertyId} onChange={setPropertyId} />
       </div>
-      <div style={S.formRow}>
+      <div style={S.formRow} className="fk-form-row">
         <label style={S.label}>
           Prioritet
           <select className="fk-input" style={S.input} value={priority} onChange={(e) => setPriority(e.target.value)}>
@@ -4484,14 +4488,14 @@ function ArendeForm({ properties, nextOrderNumber, titleFieldLabel, titlePlaceho
         <span style={S.rowSub}>tilldelas automatiskt när ärendet sparas</span>
       </div>
 
-      <div style={S.formRow}>
+      <div style={S.formRow} className="fk-form-row">
         <label style={S.label}>
           {titleFieldLabel}
           <input className="fk-input" style={S.input} value={title} onChange={(e) => setTitle(e.target.value)} placeholder={titlePlaceholder} required />
         </label>
         <PropertyPicker properties={properties} value={propertyId} onChange={setPropertyId} />
       </div>
-      <div style={S.formRow}>
+      <div style={S.formRow} className="fk-form-row">
         <label style={S.label}>
           Datum inkommen
           <input className="fk-input" style={S.input} type="date" value={reportedDate} onChange={(e) => setReportedDate(e.target.value)} required />
@@ -4531,7 +4535,7 @@ function ArendeForm({ properties, nextOrderNumber, titleFieldLabel, titlePlaceho
               <div style={{ ...S.rowSub, marginTop: 8, marginBottom: 4 }}>
                 Notera vem som anmält. Lämnar du fälten tomma registreras felanmälan ändå som "från boende".
               </div>
-              <div style={S.formRow}>
+              <div style={S.formRow} className="fk-form-row">
                 <label style={S.label}>
                   Namn
                   <input className="fk-input" style={S.input} value={reporterName} onChange={(e) => setReporterName(e.target.value)} placeholder="t.ex. Anna Andersson" />
@@ -4971,7 +4975,7 @@ function TimeEntryForm({ onSubmit }) {
 
   return (
     <form onSubmit={submit} style={S.formPanel}>
-      <div style={S.formRow}>
+      <div style={S.formRow} className="fk-form-row">
         <label style={S.label}>
           Datum
           <input className="fk-input" style={S.input} type="date" value={date} onChange={(e) => setDate(e.target.value)} required />
@@ -5028,7 +5032,7 @@ function BasisForm({ suggestedHours, includesBil, bilCount, bilRate, onSubmit })
           ({(bilCount * bilRate).toLocaleString("sv-SE")} kr).
         </div>
       )}
-      <div style={S.formRow}>
+      <div style={S.formRow} className="fk-form-row">
         <label style={S.label}>
           Timmar till underlag
           <input
@@ -6645,7 +6649,7 @@ function UtilityReportForm({ org, initial, allReports, onSubmit, onCancel }) {
   return (
     <form onSubmit={submit} style={S.formStack}>
       <FormSection title="Månad" subtitle="Skriv årtal och månad, t.ex. 202608 — det formateras automatiskt till 2026-08.">
-        <div style={S.formRow}>
+        <div style={S.formRow} className="fk-form-row">
           <label style={S.label}>
             <span>Rapportmånad</span>
             <input
@@ -6693,7 +6697,7 @@ function UtilityReportForm({ org, initial, allReports, onSubmit, onCancel }) {
         subtitle="En rad per vattenmätare (t.ex. Övre och Undre). Mätarnumren följer med till nästa månad — då fyller du bara i den nya ställningen."
       >
         {waterMeters.map((m, i) => (
-          <div key={m.id} style={S.formRow}>
+          <div key={m.id} style={S.formRow} className="fk-form-row">
             <label style={S.label}>
               Mätarnummer{waterMeters.length > 1 ? ` ${i + 1}` : ""} (valfritt)
               <input
@@ -6729,7 +6733,7 @@ function UtilityReportForm({ org, initial, allReports, onSubmit, onCancel }) {
         subtitle="En rad per elmätare. Vid mätarbyte: lägg till en rad för den nya mätaren och låt den gamla stå kvar med sin slutställning."
       >
         {elMeters.map((m, i) => (
-          <div key={m.id} style={S.formRow}>
+          <div key={m.id} style={S.formRow} className="fk-form-row">
             <label style={S.label}>
               Mätarnummer{elMeters.length > 1 ? ` ${i + 1}` : ""} (valfritt)
               <input
@@ -6765,7 +6769,7 @@ function UtilityReportForm({ org, initial, allReports, onSubmit, onCancel }) {
         subtitle="Samma uppgifter som den handskrivna driftrapporten från fjärrvärmecentralen. Förbrukningen (MWh/m³) räknas ut automatiskt mot förra månadens mätarställning."
       >
         <FormSubBox title="Mätare">
-          <div style={S.formRow}>
+          <div style={S.formRow} className="fk-form-row">
             <label style={S.label}>
               Mätarnr
               <input className="fk-input" style={S.input} value={dhMeterNr} onChange={(e) => setDhMeterNr(e.target.value)} placeholder="t.ex. 1695" />
@@ -6786,7 +6790,7 @@ function UtilityReportForm({ org, initial, allReports, onSubmit, onCancel }) {
         </FormSubBox>
 
         <FormSubBox title="Primärkrets (fjärrvärme in)">
-          <div style={S.formRow}>
+          <div style={S.formRow} className="fk-form-row">
             <label style={S.label}>
               Framledn.temp C°
               <input className="fk-input" style={S.input} type="number" step="0.1" value={dhFramledn} onChange={(e) => setDhFramledn(e.target.value)} />
@@ -6803,7 +6807,7 @@ function UtilityReportForm({ org, initial, allReports, onSubmit, onCancel }) {
         </FormSubBox>
 
         <FormSubBox title="Radiatorkrets">
-          <div style={S.formRow}>
+          <div style={S.formRow} className="fk-form-row">
             <label style={S.label}>
               Framledn.temp C°
               <input className="fk-input" style={S.input} type="number" step="0.1" value={radFramledn} onChange={(e) => setRadFramledn(e.target.value)} />
@@ -6816,7 +6820,7 @@ function UtilityReportForm({ org, initial, allReports, onSubmit, onCancel }) {
         </FormSubBox>
 
         <FormSubBox title="Tappvattenkrets & expansionskärl">
-          <div style={S.formRow}>
+          <div style={S.formRow} className="fk-form-row">
             <label style={S.label}>
               Tappvattenkrets — Temp C°
               <input className="fk-input" style={S.input} type="number" step="0.1" value={tappvattenTemp} onChange={(e) => setTappvattenTemp(e.target.value)} />
@@ -6837,7 +6841,7 @@ function UtilityReportForm({ org, initial, allReports, onSubmit, onCancel }) {
       </FormSection>
 
       <FormSection color="#1C2321" title="Till styrelserapporten">
-        <div style={S.formRow}>
+        <div style={S.formRow} className="fk-form-row">
           <label style={S.label}>
             Utfört under månaden (valfritt)
             <input className="fk-input" style={S.input} value={utfort} onChange={(e) => setUtfort(e.target.value)} placeholder="t.ex. Filterbyte ventilation, kontroll av undercentral" />
@@ -7596,6 +7600,7 @@ const S = {
     justifyContent: "space-between",
     alignItems: "center",
     padding: "12px 18px",
+    paddingTop: "calc(12px + env(safe-area-inset-top))",
     background: "#1C2321",
     color: "#EDEAE1",
     flexWrap: "wrap",
@@ -7922,6 +7927,12 @@ const S = {
   summaryTable: { borderCollapse: "collapse", width: "100%", fontSize: 13 },
   summaryTh: { textAlign: "left", padding: "6px 12px 6px 0", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, color: "#5C594E", borderBottom: "1.5px solid #1C2321" },
   summaryTd: { padding: "8px 12px 8px 0", borderBottom: "1px solid #C9C4B7", fontWeight: 500 },
+  summaryCard: { border: "1px solid #E4E0D6", borderRadius: 8, padding: "12px 14px", background: "#FBFAF7" },
+  summaryCardName: { fontFamily: "'Oswald', sans-serif", fontSize: 16, fontWeight: 600, marginBottom: 8 },
+  summaryChips: { display: "flex", flexWrap: "wrap", gap: 8 },
+  summaryChip: { display: "flex", alignItems: "baseline", gap: 6, background: "#FFFFFF", border: "1px solid #E4E0D6", borderRadius: 6, padding: "6px 10px" },
+  summaryChipValue: { fontFamily: "'IBM Plex Mono', monospace", fontSize: 16, fontWeight: 600 },
+  summaryChipLabel: { fontSize: 12, color: "#5C594E" },
 
   typeTag: {
     marginLeft: 10,

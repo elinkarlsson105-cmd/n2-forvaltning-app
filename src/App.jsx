@@ -26,6 +26,13 @@ const TABLE = "fonsterkort_state";
 const CATEGORIES = ["Snöröjning", "Filterbyte", "Gräsklippning", "Brandskydd", "VVS", "El", "Städ", "Övrigt"];
 const PRIORITIES = ["Låg", "Normal", "Akut"];
 const STATUSES = ["Öppen", "Pågår", "Klar"];
+// Färgkodning för statusrutorna i Ärenden: Klar = grön, Pågår = gul/guld,
+// Öppen = neutral mörk (som tidigare). Håller sig till appens palett.
+const STATUS_COLORS = {
+  "Öppen": { background: "#1C2321", color: "#EDEAE1", borderColor: "#1C2321" },
+  "Pågår": { background: "#C49A2A", color: "#FFFFFF", borderColor: "#C49A2A" },
+  "Klar": { background: "#2B6E5E", color: "#FFFFFF", borderColor: "#2B6E5E" },
+};
 const CONTACT_ROLES = ["Ansvarig förvaltare", "Styrelseordförande", "Styrelseledamot", "Ekonomi", "Jour", "Övrig"];
 
 const uid = () => Math.random().toString(36).slice(2, 10);
@@ -38,6 +45,10 @@ const addDays = (iso, n) => {
 const daysBetween = (a, b) => Math.round((new Date(b) - new Date(a)) / 86400000);
 const fmtDate = (iso) =>
   new Date(iso + "T00:00:00").toLocaleDateString("sv-SE", { day: "numeric", month: "short" });
+// Datum med årtal — används där det är viktigt att veta vilket år (t.ex. årliga
+// dagsberoende kontroller som brandskydd).
+const fmtDateFull = (iso) =>
+  new Date(iso + "T00:00:00").toLocaleDateString("sv-SE", { day: "numeric", month: "short", year: "numeric" });
 
 const SORT_OPTIONS = [
   { value: "datum-senaste", label: "Datum (senaste först)" },
@@ -1923,12 +1934,37 @@ function Oversikt({ state, scopedProps, selectedProperty, selectedOrg, setTab, o
     );
   const checklistStatus = checklistTemplates.map((t) => {
     const interval = t.interval || "vecka";
+    if (t.dagsberoende) {
+      // Dagsberoende: räkna ner mot nästa kontroll i stället för perioder.
+      const intervalDays = Number(t.dagintervall) || 365;
+      const last = state.checklistRuns
+        .filter((r) => r.templateId === t.id && r.done)
+        .sort((a, b) => (a.date < b.date ? 1 : -1))[0] || null;
+      const nextDue = last ? addDays(last.date, intervalDays) : null;
+      const daysLeft = nextDue ? daysBetween(today, nextDue) : null;
+      const overdue = nextDue ? nextDue < today : false;
+      const soon = !overdue && daysLeft !== null && daysLeft <= 30;
+      return {
+        template: t,
+        interval,
+        dep: true,
+        subText: !last
+          ? "Ingen kontroll registrerad ännu"
+          : overdue
+          ? `Försenad · skulle gjorts ${fmtDateFull(nextDue)}`
+          : `${daysLeft} dagar kvar till nästa`,
+        dueNow: !last || overdue || soon,
+        missedPrev: overdue,
+      };
+    }
     const cur = periodKey(new Date(), interval);
     const prev = recentPeriods(interval, 2)[0];
     return {
       template: t,
       interval,
+      dep: false,
       curKey: cur,
+      subText: `${periodLabel(cur, interval)} ej bekräftad`,
       dueNow: !runDone(t.id, cur, interval),
       missedPrev: prev !== cur && !runDone(t.id, prev, interval),
     };
@@ -2174,7 +2210,8 @@ function Oversikt({ state, scopedProps, selectedProperty, selectedOrg, setTab, o
                   <span style={{ flex: 1 }}>
                     <div style={S.rowTitle}>{c.template.title}</div>
                     <div style={S.rowSub}>
-                      {propName(c.template.propertyId)} · {periodLabel(c.curKey, c.interval)} ej bekräftad{c.missedPrev ? " · även föregående missad" : ""}
+                      {propName(c.template.propertyId)} · {c.subText}
+                      {!c.dep && c.missedPrev ? " · även föregående missad" : ""}
                     </div>
                   </span>
                 </li>
@@ -2430,6 +2467,8 @@ function Checklistor({ state, setState, scopedProps, actor, notify }) {
           ...payload,
           interval: payload.interval || "vecka",
           comment: (payload.comment || "").trim(),
+          dagsberoende: !!payload.dagsberoende,
+          dagintervall: payload.dagsberoende ? Number(payload.dagintervall) || 365 : null,
           active: true,
           items: payload.items.map((text) => ({ id: uid(), text })),
         },
@@ -2506,6 +2545,21 @@ function Checklistor({ state, setState, scopedProps, actor, notify }) {
     state.checklistRuns
       .filter((r) => r.templateId === templateId && r.done)
       .sort((a, b) => ((a.period || periodKey(a.date, interval)) < (b.period || periodKey(b.date, interval)) ? 1 : -1))[0] || null;
+
+  // Status för en dagsberoende checklista: när gjordes den senast, när är den
+  // dags igen och hur många dagar är kvar. Röd markering när mindre än en månad
+  // (30 dagar) är kvar, eller när den är försenad.
+  const dagStatus = (tmpl) => {
+    const intervalDays = Number(tmpl.dagintervall) || 365;
+    const last = state.checklistRuns
+      .filter((r) => r.templateId === tmpl.id && r.done)
+      .sort((a, b) => (a.date < b.date ? 1 : -1))[0] || null;
+    const nextDue = last ? addDays(last.date, intervalDays) : null;
+    const daysLeft = nextDue ? daysBetween(todayISO(), nextDue) : null;
+    const overdue = nextDue ? nextDue < todayISO() : false;
+    const soon = !overdue && daysLeft !== null && daysLeft <= 30;
+    return { intervalDays, last, nextDue, daysLeft, overdue, soon };
+  };
 
   // Öppna en period för avprickning. Skapar en körning om det inte redan finns en.
   const openPeriod = (template, period) => {
@@ -2608,23 +2662,33 @@ function Checklistor({ state, setState, scopedProps, actor, notify }) {
         <div style={S.checklistStack}>
           {templates.map((tmpl) => {
             const interval = tmpl.interval || "vecka";
-            const periods = recentPeriods(interval, periodCount(interval));
-            const currentKey = periodKey(new Date(), interval);
-            const currentDone = !!runFor(tmpl.id, currentKey, interval)?.done;
+            const dep = !!tmpl.dagsberoende;
+            const dstat = dep ? dagStatus(tmpl) : null;
+            // Rutnätsindelning: för dagsberoende checklistor bestäms den av
+            // dagintervallet (år/kvartal/månad/vecka), annars av valt intervall.
+            const gi = dep ? gridIntervalFor(dstat.intervalDays) : interval;
+            const periods = dep ? dayGridPeriods(gi, dstat.nextDue) : recentPeriods(gi, periodCount(gi));
+            const currentKey = periodKey(new Date(), gi);
+            const currentDone = !!runFor(tmpl.id, currentKey, gi)?.done;
             const last = lastDoneRun(tmpl.id, interval);
             const intervalLabel = INTERVAL_NAMES[interval] || "Varje vecka";
             const dueWord = interval === "vecka" ? "vecka" : interval === "månad" ? "månad" : interval === "kvartal" ? "kvartal" : "år";
             const activeRun =
-              active && active.templateId === tmpl.id ? runFor(tmpl.id, active.period, interval) : null;
+              active && active.templateId === tmpl.id ? runFor(tmpl.id, active.period, gi) : null;
+            // Röd ram när en dagsberoende checklista är försenad eller har mindre
+            // än en månad kvar.
+            const flagRed = dep && dstat.last && (dstat.overdue || dstat.soon);
             return (
-              <div key={tmpl.id} style={S.checklistCard}>
+              <div key={tmpl.id} style={{ ...S.checklistCard, ...(flagRed ? { borderColor: "#C4171C" } : {}) }}>
                 <div style={S.checklistHead}>
                   <div>
                     <div style={S.taskCardTitle}>
                       {tmpl.title}
                       {showPropertyTag && <span style={S.propertyTag}>{propName(tmpl.propertyId)}</span>}
                     </div>
-                    <div style={S.taskCardProp}>{tmpl.items.length} punkter · {intervalLabel}</div>
+                    <div style={S.taskCardProp}>
+                      {tmpl.items.length} punkter · {dep ? `var ${dstat.intervalDays}:e dag` : intervalLabel}
+                    </div>
                   </div>
                   <button
                     style={S.miniDelete}
@@ -2743,8 +2807,60 @@ function Checklistor({ state, setState, scopedProps, actor, notify }) {
                   </button>
                 )}
 
+                {/* Dagsberoende: nedräkning till nästa kontroll. Röd vid mindre än
+                    en månad kvar eller när kontrollen är försenad. */}
+                {dep && (() => {
+                  const c = dstat;
+                  const color = !c.last ? "#8a8578" : c.overdue || c.soon ? "#C4171C" : "#2B6E5E";
+                  const bg = !c.last ? "#F5F3EE" : c.overdue || c.soon ? "#FCEDED" : "#F0F5F2";
+                  const label = !c.last ? "EJ GJORD" : c.overdue ? "FÖRSENAD" : "NÄSTA";
+                  const big = !c.last
+                    ? "—"
+                    : c.overdue
+                    ? `${Math.abs(c.daysLeft)} d sedan`
+                    : `${c.daysLeft} d kvar`;
+                  const sub = !c.last
+                    ? "Ingen kontroll registrerad ännu"
+                    : c.overdue
+                    ? `Skulle ha gjorts ${fmtDateFull(c.nextDue)}`
+                    : `Nästa senast ${fmtDateFull(c.nextDue)}`;
+                  return (
+                    <div
+                      style={{
+                        marginTop: 10,
+                        padding: "10px 12px",
+                        borderRadius: 8,
+                        border: `1px solid ${color}`,
+                        background: bg,
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        gap: 10,
+                        flexWrap: "wrap",
+                      }}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                        <div style={{ ...S.stampBadge, borderColor: color, color }}>
+                          <div style={S.stampBadgeLabel}>{label}</div>
+                          <div style={S.stampBadgeDate}>{big}</div>
+                        </div>
+                        <span style={{ fontSize: 12.5, color: "#3A413C" }}>{sub}</span>
+                      </div>
+                      {!activeRun && (
+                        <button
+                          style={{ ...S.stampBtn, background: color, color: "#fff" }}
+                          className="fk-btn"
+                          onClick={() => openPeriod(tmpl, currentKey)}
+                        >
+                          Registrera {shortPeriodLabel(currentKey, gi)}
+                        </button>
+                      )}
+                    </div>
+                  );
+                })()}
+
                 {/* "Dags nu"-signal: innevarande period är inte bekräftad ännu. */}
-                {!currentDone && (
+                {!dep && !currentDone && (
                   <div
                     style={{
                       marginTop: 8,
@@ -2772,13 +2888,16 @@ function Checklistor({ state, setState, scopedProps, actor, notify }) {
                   </div>
                 )}
 
-                {/* Periodrutnät: en ruta per period (vecka/månad/år).
+                {/* Periodrutnät: en ruta per period (vecka/månad/kvartal/år).
                     Grön ✓ = bekräftad och alla punkter ibockade.
                     Orange ✓ = bekräftad men alla punkter var inte ibockade.
-                    Gul = påbörjad (ej bekräftad). Tryck på en ruta för att pricka av. */}
+                    Gul = påbörjad (ej bekräftad). Streckad = kommande period.
+                    Tryck på en ruta för att pricka av / registrera.
+                    Dagsberoende checklistor ritas år för år (eller finare) så att
+                    historik och kommande kontroller syns tydligt. */}
                 <div style={{ display: "flex", gap: 6, overflowX: "auto", paddingBottom: 4, marginTop: 6 }}>
                   {periods.map((pk) => {
-                    const run = runFor(tmpl.id, pk, interval);
+                    const run = runFor(tmpl.id, pk, gi);
                     const done = !!run?.done;
                     // Bekräftad men inte alla punkter ibockade → orange markör.
                     const doneIncomplete =
@@ -2786,35 +2905,51 @@ function Checklistor({ state, setState, scopedProps, actor, notify }) {
                     const partial = run && !done && run.checkedItemIds.length > 0;
                     const isActive = active && active.templateId === tmpl.id && active.period === pk;
                     const isCurrent = pk === currentKey;
+                    const isFuture = pk > currentKey;
+                    // För dagsberoende: markera rutan där nästa kontroll förfaller.
+                    // Röd endast när det är nära (mindre än en månad kvar).
+                    const isNextDue = dep && dstat.nextDue && pk === periodKey(dstat.nextDue, gi);
+                    const nextDueSoon = isNextDue && dstat.soon;
                     const doneColor = doneIncomplete ? "#E0871E" : "#2B6E5E";
                     return (
                       <button
                         key={pk}
                         className="fk-btn"
-                        onClick={() => openPeriod(tmpl, pk)}
+                        disabled={isFuture && !done}
+                        onClick={() => { if (!(isFuture && !done)) openPeriod(tmpl, pk); }}
                         style={{
                           flex: "0 0 auto",
                           minWidth: 52,
                           padding: "6px 8px",
                           borderRadius: 6,
-                          cursor: "pointer",
+                          cursor: isFuture && !done ? "default" : "pointer",
                           border: isActive
                             ? "2px solid #2B6E5E"
+                            : isFuture && !done
+                            ? `1px dashed ${nextDueSoon ? "#C4171C" : "#C9C4B7"}`
                             : `1px solid ${done ? doneColor : partial ? "#C49A2A" : "#C9C4B7"}`,
-                          background: done ? doneColor : "#fff",
-                          color: done ? "#fff" : "#3A413C",
+                          background: done ? doneColor : isFuture ? "#FBFAF7" : "#fff",
+                          color: done ? "#fff" : isFuture ? "#8a8578" : "#3A413C",
                           display: "flex",
                           flexDirection: "column",
                           alignItems: "center",
                           gap: 2,
                         }}
                       >
-                        <span style={{ fontSize: 11, fontWeight: 600 }}>{shortPeriodLabel(pk, interval)}</span>
+                        <span style={{ fontSize: 11, fontWeight: 600 }}>{shortPeriodLabel(pk, gi)}</span>
                         <span style={{ fontSize: 12, fontWeight: 700 }}>
-                          {done ? "✓" : partial ? `${run.checkedItemIds.length}/${tmpl.items.length}` : "–"}
+                          {done ? "✓" : partial ? `${run.checkedItemIds.length}/${tmpl.items.length}` : isFuture ? "·" : "–"}
                         </span>
-                        <span style={{ fontSize: 9, opacity: 0.85, minHeight: 11 }}>
-                          {doneIncomplete ? `${run.checkedItemIds.length}/${tmpl.items.length}` : isCurrent ? "nu" : ""}
+                        <span style={{ fontSize: 9, opacity: 0.85, minHeight: 11, color: nextDueSoon ? "#C4171C" : undefined }}>
+                          {doneIncomplete
+                            ? `${run.checkedItemIds.length}/${tmpl.items.length}`
+                            : nextDueSoon
+                            ? "dags"
+                            : isCurrent
+                            ? "nu"
+                            : isFuture
+                            ? "kommer"
+                            : ""}
                         </span>
                       </button>
                     );
@@ -2825,7 +2960,9 @@ function Checklistor({ state, setState, scopedProps, actor, notify }) {
                   <div style={S.runBox}>
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
                       <span style={{ ...S.rowSub, fontWeight: 600, margin: 0 }}>
-                        {periodLabel(activeRun.period || active.period, interval)}
+                        {dep
+                          ? `Kontroll ${periodLabel(activeRun.period || active.period, gi)}${activeRun.done ? ` · ${fmtDateFull(activeRun.date)}` : ""}`
+                          : periodLabel(activeRun.period || active.period, interval)}
                         {activeRun.done ? " · bekräftad" : ""}
                         {activeRun.done &&
                           tmpl.items.length > 0 &&
@@ -2869,7 +3006,7 @@ function Checklistor({ state, setState, scopedProps, actor, notify }) {
                       <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                         {!activeRun.done ? (
                           <button style={S.primaryBtnSmall} className="fk-btn" onClick={() => confirmRun(activeRun)}>
-                            Bekräfta perioden
+                            {dep ? "Bekräfta kontroll" : "Bekräfta perioden"}
                           </button>
                         ) : reopenTarget !== activeRun.id ? (
                           <button
@@ -2930,7 +3067,11 @@ function Checklistor({ state, setState, scopedProps, actor, notify }) {
                 )}
 
                 <div style={S.historyRow}>
-                  {last
+                  {dep
+                    ? dstat.last
+                      ? `Senast gjord: ${fmtDateFull(dstat.last.date)} av ${dstat.last.doneBy}`
+                      : "Ingen kontroll registrerad ännu — tryck ”Registrera”."
+                    : last
                     ? `Senast bekräftad: ${periodLabel(last.period || periodKey(last.date, interval), interval)} av ${last.doneBy}`
                     : "Ingen period bekräftad ännu — tryck på en ruta för att pricka av."}
                 </div>
@@ -2955,7 +3096,9 @@ function Checklistor({ state, setState, scopedProps, actor, notify }) {
             <div style={{ ...S.checklistStack, marginTop: 10 }}>
               {inactiveTemplates.map((tmpl) => {
                 const interval = tmpl.interval || "vecka";
-                const intervalLabel = INTERVAL_NAMES[interval] || "Varje vecka";
+                const intervalLabel = tmpl.dagsberoende
+                  ? `var ${Number(tmpl.dagintervall) || 365}:e dag`
+                  : INTERVAL_NAMES[interval] || "Varje vecka";
                 const confirmedCount = state.checklistRuns.filter(
                   (r) => r.templateId === tmpl.id && r.done
                 ).length;
@@ -3000,12 +3143,26 @@ function ChecklistForm({ properties, onSubmit }) {
   const [propertyId, setPropertyId] = useState(properties[0]?.id || "");
   const [interval, setInterval] = useState("vecka");
   const [comment, setComment] = useState("");
+  // Dagsberoende checklista: räknar ner dagar till nästa kontroll i stället för
+  // att följa kalenderperioder. Bra för t.ex. årliga besiktningar där man vill
+  // se exakt hur många dagar som är kvar.
+  const [dagsberoende, setDagsberoende] = useState(false);
+  const [dagintervall, setDagintervall] = useState(365);
 
   const submit = (e) => {
     e.preventDefault();
     const items = itemsText.split("\n").map((s) => s.trim()).filter(Boolean);
     if (!title.trim() || !propertyId || items.length === 0) return;
-    onSubmit({ title: title.trim(), propertyId, interval, items, comment });
+    if (dagsberoende && (!dagintervall || Number(dagintervall) < 1)) return;
+    onSubmit({
+      title: title.trim(),
+      propertyId,
+      interval,
+      items,
+      comment,
+      dagsberoende,
+      dagintervall: dagsberoende ? Number(dagintervall) : null,
+    });
   };
 
   return (
@@ -3017,15 +3174,65 @@ function ChecklistForm({ properties, onSubmit }) {
         </label>
         <PropertyPicker properties={properties} value={propertyId} onChange={setPropertyId} />
       </div>
+
+      {/* Val av hur checklistan följs upp: kalenderperioder eller nedräkning i dagar. */}
+      <label
+        style={{
+          display: "flex",
+          alignItems: "flex-start",
+          gap: 10,
+          padding: "10px 12px",
+          borderRadius: 8,
+          border: `1px solid ${dagsberoende ? "#2B6E5E" : "#C9C4B7"}`,
+          background: dagsberoende ? "#F0F5F2" : "#F7F5F0",
+          cursor: "pointer",
+        }}
+      >
+        <input
+          type="checkbox"
+          checked={dagsberoende}
+          onChange={(e) => setDagsberoende(e.target.checked)}
+          style={{ ...S.checkbox, marginTop: 2 }}
+        />
+        <span>
+          <span style={{ fontWeight: 600, fontSize: 13.5, color: "#3A413C" }}>
+            Dagsberoende — räkna dagar till nästa kontroll
+          </span>
+          <span style={{ display: "block", fontSize: 12, color: "#5C594E", marginTop: 2 }}>
+            Bocka i för t.ex. årliga besiktningar där du vill se hur många dagar som är
+            kvar innan nästa kontroll måste göras. Lämna tom för vanlig avprickning per
+            vecka/månad/kvartal/år.
+          </span>
+        </span>
+      </label>
+
       <div style={S.formRow}>
-        <label style={S.label}>
-          Intervall
-          <select className="fk-input" style={S.input} value={interval} onChange={(e) => setInterval(e.target.value)}>
-            {CHECKLIST_INTERVALS.map((iv) => (
-              <option key={iv} value={iv}>{INTERVAL_NAMES[iv]}</option>
-            ))}
-          </select>
-        </label>
+        {dagsberoende ? (
+          <label style={S.label}>
+            Antal dagar mellan kontroller
+            <input
+              className="fk-input"
+              type="number"
+              min="1"
+              style={S.input}
+              value={dagintervall}
+              onChange={(e) => setDagintervall(e.target.value)}
+              placeholder="t.ex. 365"
+            />
+            <span style={{ fontSize: 11.5, color: "#8a8578", marginTop: 4 }}>
+              365 = varje år · 180 = halvår · 90 = kvartal · 30 = månad
+            </span>
+          </label>
+        ) : (
+          <label style={S.label}>
+            Intervall
+            <select className="fk-input" style={S.input} value={interval} onChange={(e) => setInterval(e.target.value)}>
+              {CHECKLIST_INTERVALS.map((iv) => (
+                <option key={iv} value={iv}>{INTERVAL_NAMES[iv]}</option>
+              ))}
+            </select>
+          </label>
+        )}
         <div />
       </div>
       <label style={S.label}>
@@ -3058,36 +3265,349 @@ function ChecklistForm({ properties, onSubmit }) {
 
 function Arenden({ state, setState, scopedProps, actor, notify }) {
   const [showForm, setShowForm] = useState(false);
+  // Vilket ärende som just nu klarmarkeras (då krävs en lösningskommentar).
+  const [resolveTarget, setResolveTarget] = useState(null);
+  const [resolveComment, setResolveComment] = useState("");
+  // Vilket ärende som just nu görs om till en felanmälan (skapar order + klarmarkerar).
+  const [felanmalanTarget, setFelanmalanTarget] = useState(null);
+  const [felanmalanNote, setFelanmalanNote] = useState("");
+  const [felanmalanCategory, setFelanmalanCategory] = useState("FA");
+  const [felanmalanBil, setFelanmalanBil] = useState(false);
+  const [felanmalanBilCount, setFelanmalanBilCount] = useState(1);
+  // Vilka ärenden som är utfällda (visar beskrivning, logg m.m.). Radvyn är
+  // kompakt som standard och detaljerna fälls ut vid behov.
+  const [expanded, setExpanded] = useState(() => new Set());
+  const toggleExpand = (id) =>
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+
   const ids = new Set(scopedProps.map((p) => p.id));
   const showPropertyTag = scopedProps.length > 1;
   const propName = (id) => state.properties.find((p) => p.id === id)?.name || "";
+
   const issues = state.issues
     .filter((i) => ids.has(i.propertyId))
     .sort((a, b) => (a.reportedAt < b.reportedAt ? 1 : -1));
 
+  const activeIssues = issues.filter((i) => i.status !== "Klar");
+  const doneIssues = issues.filter((i) => i.status === "Klar");
+
   const addIssue = (payload) => {
+    const now = todayISO();
     const issue = {
       id: uid(),
       ...payload,
       status: "Öppen",
       reportedBy: actor || "Okänd",
-      reportedAt: todayISO(),
+      reportedAt: now,
+      logg: [{ datum: now, av: actor || "Okänd", handelse: "Registrerad" }],
     };
     setState({ ...state, issues: [...state.issues, issue] });
     setShowForm(false);
     notify("Ärende registrerat");
   };
 
+  // Statusbyte. Att sätta ett ärende till "Klar" kräver en lösningskommentar och
+  // går därför via klarmarkeringsrutan nedan. Övriga byten sker direkt och loggas.
   const setStatus = (issue, status) => {
-    setState({ ...state, issues: state.issues.map((i) => (i.id === issue.id ? { ...i, status } : i)) });
+    if (status === issue.status) return;
+    if (status === "Klar") {
+      setResolveTarget(issue.id);
+      setResolveComment("");
+      setFelanmalanTarget(null);
+      setExpanded((prev) => new Set(prev).add(issue.id));
+      return;
+    }
+    const wasKlar = issue.status === "Klar";
+    const now = todayISO();
+    const entry = {
+      datum: now,
+      av: actor || "Okänd",
+      handelse: wasKlar ? "Återöppnad" : `Status ändrad till ${status}`,
+    };
+    setState({
+      ...state,
+      issues: state.issues.map((i) =>
+        i.id === issue.id ? { ...i, status, resolvedAt: null, logg: [...(i.logg || []), entry] } : i
+      ),
+    });
+    if (resolveTarget === issue.id) { setResolveTarget(null); setResolveComment(""); }
+    notify(wasKlar ? `${issue.title} återöppnad — loggat` : `${issue.title} → ${status}`);
   };
 
-  const removeIssue = (id) => setState({ ...state, issues: state.issues.filter((i) => i.id !== id) });
+  const confirmResolve = (issue) => {
+    const comment = resolveComment.trim();
+    if (!comment) return;
+    const now = todayISO();
+    const entry = { datum: now, av: actor || "Okänd", handelse: "Klarmarkerad", kommentar: comment };
+    setState({
+      ...state,
+      issues: state.issues.map((i) =>
+        i.id === issue.id ? { ...i, status: "Klar", resolvedAt: now, logg: [...(i.logg || []), entry] } : i
+      ),
+    });
+    setResolveTarget(null);
+    setResolveComment("");
+    notify(`${issue.title} klarmarkerad`);
+  };
+
+  const openFelanmalan = (issue) => {
+    setFelanmalanTarget(issue.id);
+    setFelanmalanNote("");
+    setFelanmalanCategory("FA");
+    setFelanmalanBil(false);
+    setFelanmalanBilCount(1);
+    setResolveTarget(null);
+    setExpanded((prev) => new Set(prev).add(issue.id));
+  };
+
+  // Skapar en felanmälan (debiterbar order) av ärendet och klarmarkerar ärendet
+  // i samma steg. Båda ändringarna görs i EN setState så inget skrivs över.
+  const createFelanmalan = (issue) => {
+    const note = felanmalanNote.trim();
+    const now = todayISO();
+    const orderNumber = state.nextOrderNumber || 1;
+    const billCount = felanmalanBil ? Math.max(1, Number(felanmalanBilCount) || 1) : 0;
+    const order = {
+      id: uid(),
+      title: issue.title,
+      description: issue.description || "",
+      propertyId: issue.propertyId,
+      type: "felanmalan",
+      orderNumber,
+      status: "Pågår",
+      priceCategory: felanmalanCategory === "TEK" ? "TEK" : "FA",
+      reportedDate: issue.reportedAt || now,
+      createdAt: now,
+      createdBy: actor || "Okänd",
+      completedAt: null,
+      billCount,
+      billInvoicedInBasisId: null,
+      cancelled: false,
+      cancelledAt: null,
+      cancelledReason: null,
+      cancelledBy: null,
+      logg: [],
+      // Anmälaruppgifter följer med om ärendet kom från en boende.
+      reporterName: issue.reporterName || "",
+      reporterContact: issue.reporterContact || "",
+      reporterAddress: issue.reporterAddress || "",
+    };
+    // Sammanfatta vad som skapades i ärendets logg — kategori och ev. bil syns
+    // så man i efterhand ser vad som gick vidare till faktureringsunderlaget.
+    const bilText = billCount > 0 ? `, bil ${billCount} st` : "";
+    const bas = `Felanmälan #${orderNumber} skapad (${order.priceCategory}${bilText})`;
+    const kommentar = note ? `${bas} — ${note}` : bas;
+    const entry = { datum: now, av: actor || "Okänd", handelse: "Klarmarkerad", kommentar };
+    setState({
+      ...state,
+      billableOrders: [...(state.billableOrders || []), order],
+      nextOrderNumber: orderNumber + 1,
+      issues: state.issues.map((i) =>
+        i.id === issue.id ? { ...i, status: "Klar", resolvedAt: now, logg: [...(i.logg || []), entry] } : i
+      ),
+    });
+    setFelanmalanTarget(null);
+    setFelanmalanNote("");
+    notify(`Felanmälan #${orderNumber} skapad — ärendet klarmarkerat`);
+  };
+
+  const renderCard = (i, done) => {
+    const isOpen = expanded.has(i.id);
+    return (
+      <div
+        key={i.id}
+        style={{
+          ...S.issueCard,
+          ...(done
+            ? { background: "#F5FBF6", borderColor: "#C3E4C6" }
+            : { borderColor: i.priority === "Akut" ? "#C4171C" : "#C9C4B7" }),
+        }}
+      >
+        {/* Kompakt rad — klicka för att fälla ut detaljer/logg. */}
+        <div style={S.issueRow} onClick={() => toggleExpand(i.id)}>
+          <span style={{ ...S.issueChevron, transform: isOpen ? "rotate(90deg)" : "none" }}>▸</span>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={S.issueTitle}>
+              {i.title}
+              {showPropertyTag && <span style={S.propertyTag}>{propName(i.propertyId)}</span>}
+            </div>
+            <div style={S.issueMeta}>
+              {i.priority === "Akut" && <span style={{ color: "#C4171C", fontWeight: 700 }}>Akut · </span>}
+              Anmält {fmtDate(i.reportedAt)} av {i.reportedBy}
+            </div>
+          </div>
+          <span style={{ ...S.statusPill, ...(STATUS_COLORS[i.status] || S.statusPillActive), whiteSpace: "nowrap" }}>
+            {i.status}
+          </span>
+        </div>
+
+        {isOpen && (
+          <div style={S.issueDetails}>
+            {i.reporterAddress && (
+              <div style={{ ...S.rowSub, marginTop: 0 }}>
+                <strong style={{ color: "#1C2321" }}>Adress:</strong> {i.reporterAddress}
+              </div>
+            )}
+            {i.description && <div style={{ ...S.rowSub, marginTop: 6 }}>{i.description}</div>}
+            {(i.reporterName || i.reporterContact) && (
+              <div style={{ ...S.rowSub, marginTop: 4, fontStyle: "italic" }}>
+                Anmält av: {[i.reporterName, i.reporterContact].filter(Boolean).join(" · ")}
+              </div>
+            )}
+
+            <div style={{ ...S.issueFooter, marginTop: 12 }}>
+              <span style={{ ...S.priorityTag, color: i.priority === "Akut" ? "#C4171C" : "#1C2321" }}>
+                {i.priority}
+              </span>
+              <div style={S.statusRow}>
+                {STATUSES.map((s) => (
+                  <button
+                    key={s}
+                    onClick={() => setStatus(i, s)}
+                    style={{ ...S.statusPill, ...(i.status === s ? (STATUS_COLORS[s] || S.statusPillActive) : {}) }}
+                  >
+                    {s}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {!done && resolveTarget !== i.id && felanmalanTarget !== i.id && (
+              <div style={{ marginTop: 10 }}>
+                <button style={S.felanmalanBtn} className="fk-btn" onClick={() => openFelanmalan(i)}>
+                  Skapa felanmälan av ärendet
+                </button>
+              </div>
+            )}
+
+            {felanmalanTarget === i.id && (
+              <div style={{ marginTop: 10, padding: "10px 12px", border: "1px solid #C9C4B7", borderRadius: 8, background: "#FBFAF7" }}>
+                <div style={{ ...S.rowSub, marginBottom: 6 }}>
+                  En felanmälan skapas i Debitering (Att hantera) med ärendets uppgifter, och ärendet
+                  klarmarkeras. Skriv gärna en notering — annars loggas bara att felanmälan skapades.
+                </div>
+                <textarea
+                  className="fk-input"
+                  style={{ ...S.input, height: 70, resize: "vertical" }}
+                  value={felanmalanNote}
+                  onChange={(e) => setFelanmalanNote(e.target.value)}
+                  placeholder="Valfri notering, t.ex. Kräver rörmokare — vidarebefordrat till jour"
+                  autoFocus
+                />
+                <div style={{ ...S.formRow, marginTop: 8 }}>
+                  <label style={S.label}>
+                    Kategori
+                    <select
+                      className="fk-input"
+                      style={S.input}
+                      value={felanmalanCategory}
+                      onChange={(e) => setFelanmalanCategory(e.target.value)}
+                    >
+                      <option value="FA">FA</option>
+                      <option value="TEK">TEK</option>
+                    </select>
+                  </label>
+                </div>
+                <div style={{ ...S.bilRow, marginTop: 4 }}>
+                  <label style={S.checkRow}>
+                    <input
+                      type="checkbox"
+                      checked={felanmalanBil}
+                      onChange={(e) => {
+                        setFelanmalanBil(e.target.checked);
+                        if (e.target.checked) setFelanmalanBilCount(1);
+                      }}
+                      style={S.checkbox}
+                    />
+                    Debitera bil
+                  </label>
+                  {felanmalanBil && (
+                    <div style={S.bilStepper}>
+                      <button
+                        type="button"
+                        onClick={() => setFelanmalanBilCount((c) => Math.max(1, c - 1))}
+                        style={S.bilStepBtn}
+                        aria-label="Färre bilar"
+                      >
+                        −
+                      </button>
+                      <span style={S.bilCount}>{felanmalanBilCount} {felanmalanBilCount === 1 ? "bil" : "bilar"}</span>
+                      <button
+                        type="button"
+                        onClick={() => setFelanmalanBilCount((c) => c + 1)}
+                        style={S.bilStepBtn}
+                        aria-label="Fler bilar"
+                      >
+                        +
+                      </button>
+                    </div>
+                  )}
+                </div>
+                <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+                  <button style={S.primaryBtnSmall} className="fk-btn" onClick={() => createFelanmalan(i)}>
+                    Skapa felanmälan
+                  </button>
+                  <button style={S.linkBtn} className="fk-btn" onClick={() => { setFelanmalanTarget(null); setFelanmalanNote(""); }}>
+                    Avbryt
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {resolveTarget === i.id && (
+              <div style={{ marginTop: 10, padding: "10px 12px", border: "1px solid #C9C4B7", borderRadius: 8 }}>
+                <div style={{ ...S.rowSub, marginBottom: 6 }}>
+                  Beskriv hur ärendet lösts — det sparas i loggen tillsammans med vem och när.
+                </div>
+                <textarea
+                  className="fk-input"
+                  style={{ ...S.input, height: 80, resize: "vertical" }}
+                  value={resolveComment}
+                  onChange={(e) => setResolveComment(e.target.value)}
+                  placeholder="t.ex. Bytte packning och kontrollerade att läckaget upphört"
+                  autoFocus
+                />
+                <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+                  <button
+                    style={{ ...S.primaryBtnSmall, opacity: resolveComment.trim() ? 1 : 0.5 }}
+                    className="fk-btn"
+                    disabled={!resolveComment.trim()}
+                    onClick={() => confirmResolve(i)}
+                  >
+                    Markera som klar
+                  </button>
+                  <button style={S.linkBtn} className="fk-btn" onClick={() => { setResolveTarget(null); setResolveComment(""); }}>
+                    Avbryt
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {(i.logg || []).length > 0 && (
+              <div style={{ ...S.rowSub, marginTop: 12, fontSize: 12 }}>
+                <div style={{ fontWeight: 600, marginBottom: 2 }}>Logg</div>
+                {(i.logg || []).map((l, idx) => (
+                  <div key={idx} style={{ marginBottom: 2 }}>
+                    {l.handelse} {fmtDate(l.datum)} av {l.av}
+                    {l.kommentar ? <span style={{ color: "#B07A16" }}> — {l.kommentar}</span> : null}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  };
 
   return (
     <div style={{ animation: "fk-rise .25s ease" }}>
       <div style={S.sectionHead}>
-        <h2 style={S.h2}>Felanmälningar & ärenden</h2>
+        <h2 style={S.h2}>Ärenden</h2>
         <button style={showForm ? S.secondaryBtn : S.addBtn} className="fk-btn" onClick={() => setShowForm((s) => !s)}>
           {showForm ? "Avbryt" : "+ Nytt ärende"}
         </button>
@@ -3098,51 +3618,21 @@ function Arenden({ state, setState, scopedProps, actor, notify }) {
       {issues.length === 0 ? (
         <EmptyNote text="Inga ärenden registrerade." />
       ) : (
-        <div style={S.checklistStack}>
-          {issues.map((i) => (
-            <div key={i.id} style={{ ...S.checklistCard, borderColor: i.priority === "Akut" ? "#C4171C" : "#C9C4B7" }}>
-              <div style={S.checklistHead}>
-                <div>
-                  <div style={S.taskCardTitle}>
-                    {i.title}
-                    {showPropertyTag && <span style={S.propertyTag}>{propName(i.propertyId)}</span>}
-                  </div>
-                  <div style={S.taskCardProp}>
-                    Anmält {fmtDate(i.reportedAt)} av {i.reportedBy}
-                  </div>
-                  {i.reporterAddress && (
-                    <div style={{ ...S.rowSub, marginTop: 4 }}>
-                      <strong style={{ color: "#1C2321" }}>Adress:</strong> {i.reporterAddress}
-                    </div>
-                  )}
-                  {i.description && <div style={{ ...S.rowSub, marginTop: 6 }}>{i.description}</div>}
-                  {(i.reporterName || i.reporterContact) && (
-                    <div style={{ ...S.rowSub, marginTop: 4, fontStyle: "italic" }}>
-                      Anmält av: {[i.reporterName, i.reporterContact].filter(Boolean).join(" · ")}
-                    </div>
-                  )}
-                </div>
-                <button style={S.miniDelete} onClick={() => removeIssue(i.id)} aria-label="Ta bort ärende">×</button>
-              </div>
-              <div style={S.issueFooter}>
-                <span style={{ ...S.priorityTag, color: i.priority === "Akut" ? "#C4171C" : "#1C2321" }}>
-                  {i.priority}
-                </span>
-                <div style={S.statusRow}>
-                  {STATUSES.map((s) => (
-                    <button
-                      key={s}
-                      onClick={() => setStatus(i, s)}
-                      style={{ ...S.statusPill, ...(i.status === s ? S.statusPillActive : {}) }}
-                    >
-                      {s}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            </div>
-          ))}
-        </div>
+        <>
+          <h3 style={S.panelTitle}>Att hantera</h3>
+          {activeIssues.length === 0 ? (
+            <EmptyNote text="Inga öppna ärenden just nu." />
+          ) : (
+            <div style={S.checklistStack}>{activeIssues.map((i) => renderCard(i, false))}</div>
+          )}
+
+          {doneIssues.length > 0 && (
+            <>
+              <h3 style={{ ...S.panelTitle, marginTop: 24 }}>Klara ärenden</h3>
+              <div style={S.checklistStack}>{doneIssues.map((i) => renderCard(i, true))}</div>
+            </>
+          )}
+        </>
       )}
     </div>
   );
@@ -5014,6 +5504,45 @@ function recentPeriods(interval, count) {
     keys.push(periodKey(d, interval));
   }
   return keys;
+}
+
+// Vilken rutnätsindelning en dagsberoende checklista ska ritas i, utifrån hur
+// många dagar det är mellan kontrollerna. En årlig kontroll (t.ex. brandskydd)
+// visas år för år; tätare kontroller får finare rutor.
+function gridIntervalFor(dagintervall) {
+  const d = Number(dagintervall) || 365;
+  if (d >= 150) return "år";
+  if (d >= 45) return "kvartal";
+  if (d >= 12) return "månad";
+  return "vecka";
+}
+
+// Flytta ett datum k perioder framåt (eller bakåt med negativt k).
+function shiftPeriod(date, interval, k) {
+  const d = new Date(date);
+  if (interval === "år") d.setFullYear(d.getFullYear() + k);
+  else if (interval === "kvartal") d.setMonth(d.getMonth() + k * 3);
+  else if (interval === "månad") d.setMonth(d.getMonth() + k);
+  else d.setDate(d.getDate() + k * 7);
+  return d;
+}
+
+// Rutnät för en dagsberoende checklista: historiken bakåt + innevarande +
+// kommande period(er) fram till nästa förfallodatum, så det syns vad som är
+// gjort och vad som ligger framför.
+function dayGridPeriods(interval, nextDueISO) {
+  const base = recentPeriods(interval, periodCount(interval));
+  const now = new Date();
+  let fwd = 1;
+  if (nextDueISO) {
+    const ndk = periodKey(nextDueISO, interval);
+    for (let k = 1; k <= 4; k++) {
+      if (periodKey(shiftPeriod(now, interval, k), interval) === ndk) { fwd = k; break; }
+    }
+  }
+  const out = [...base];
+  for (let k = 1; k <= fwd; k++) out.push(periodKey(shiftPeriod(now, interval, k), interval));
+  return out;
 }
 
 /* Graddagar-redigering: gemensam serie för alla föreningar, med möjlighet att
@@ -7226,6 +7755,13 @@ const S = {
 
   issueFooter: { display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 12, flexWrap: "wrap", gap: 8 },
   priorityTag: { fontSize: 12, fontWeight: 700, fontFamily: "'IBM Plex Mono', monospace" },
+  issueCard: { background: "#FFFFFF", border: "1.5px solid #C9C4B7", borderRadius: 8, padding: "10px 12px" },
+  issueRow: { display: "flex", alignItems: "center", gap: 10, cursor: "pointer" },
+  issueChevron: { fontSize: 12, color: "#8a8578", transition: "transform .15s ease", width: 12, flexShrink: 0 },
+  issueTitle: { fontFamily: "'Oswald', sans-serif", fontSize: 15, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
+  issueMeta: { fontSize: 11.5, color: "#5C594E", marginTop: 1 },
+  issueDetails: { marginTop: 10, paddingTop: 10, borderTop: "1px solid #EAE7DE" },
+  felanmalanBtn: { background: "transparent", color: "#2B6E5E", border: "1px solid #2B6E5E", borderRadius: 6, padding: "7px 12px", fontSize: 12.5, fontWeight: 600 },
   statusRow: { display: "flex", gap: 6 },
   statusPill: { border: "1px solid #C9C4B7", background: "#FBFAF7", borderRadius: 14, padding: "5px 11px", fontSize: 11.5, color: "#5C594E" },
   statusPillActive: { background: "#1C2321", color: "#EDEAE1", borderColor: "#1C2321" },

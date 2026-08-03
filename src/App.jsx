@@ -1392,7 +1392,6 @@ function AuthenticatedApp({ session }) {
     { id: "tillaggstjanst", label: "Tilläggstjänster" },
     { id: "debitering", label: "Debitering" },
     { id: "driftrapporter", label: "Driftrapporter" },
-    { id: "kalender", label: "Kalender" },
     { id: "backup", label: "Backup" },
   ];
 
@@ -1582,7 +1581,6 @@ function AuthenticatedApp({ session }) {
                 notify={notify}
               />
             )}
-            {tab === "kalender" && <Kalender state={state} scopedProps={scopedProps} />}
             {tab === "backup" && (
               <Backup state={state} setState={setState} notify={notify} lastSavedAt={lastSavedAt} />
             )}
@@ -2217,7 +2215,6 @@ function Oversikt({ state, scopedProps, selectedProperty, selectedOrg, setTab, o
     };
   });
   const dueNow = checklistStatus.filter((c) => c.dueNow);
-  const missed = checklistStatus.filter((c) => c.missedPrev);
   const openIssues = issues.filter((i) => i.status !== "Klar");
   const acuteIssues = openIssues.filter((i) => i.priority === "Akut");
   const openFelanmalan = orders.filter((o) => ids.has(o.propertyId) && o.type === "felanmalan" && o.status !== "Klar" && !o.cancelled);
@@ -2432,12 +2429,6 @@ function Oversikt({ state, scopedProps, selectedProperty, selectedOrg, setTab, o
           onClick={() => setTab("checklistor")}
         />
         <StatCard
-          label="Missade perioder"
-          value={missed.length}
-          tone={missed.length ? "warn" : "neutral"}
-          onClick={() => setTab("checklistor")}
-        />
-        <StatCard
           label="Öppna ärenden"
           value={openIssues.length}
           tone={acuteIssues.length ? "warn" : "neutral"}
@@ -2457,59 +2448,27 @@ function Oversikt({ state, scopedProps, selectedProperty, selectedOrg, setTab, o
         />
       </div>
 
-      <div style={S.twoCol}>
-        <section style={S.panel}>
-          <h3 style={S.panelTitle}>Checklistor att pricka av</h3>
-          {dueNow.length === 0 ? (
-            <EmptyNote text="Alla checklistor är avprickade för sina perioder. Bra läge." />
-          ) : (
-            <ul style={S.plainList}>
-              {dueNow.slice(0, 8).map((c) => (
-                <li key={c.template.id} style={S.rowItem}>
-                  <span style={{ ...S.dot, background: c.missedPrev ? "#C4171C" : "#C49A2A" }} />
-                  <span style={{ flex: 1 }}>
-                    <div style={S.rowTitle}>{c.template.title}</div>
-                    <div style={S.rowSub}>
-                      {propName(c.template.propertyId)} · {c.subText}
-                      {!c.dep && c.missedPrev ? " · även föregående missad" : ""}
-                    </div>
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </section>
-
-        <section style={S.panel}>
-          <h3 style={S.panelTitle}>Akuta & öppna ärenden</h3>
-          {openIssues.length === 0 ? (
-            <EmptyNote text="Inga öppna ärenden." />
-          ) : (
-            <ul style={S.plainList}>
-              {openIssues
-                .slice()
-                .sort((a, b) => (a.priority === "Akut" ? -1 : 1))
-                .slice(0, 8)
-                .map((i) => (
-                  <li key={i.id} style={S.rowItem}>
-                    <span
-                      style={{
-                        ...S.dot,
-                        background: i.priority === "Akut" ? "#C4171C" : "#8a8578",
-                      }}
-                    />
-                    <span style={{ flex: 1 }}>
-                      <div style={S.rowTitle}>{i.title}</div>
-                      <div style={S.rowSub}>
-                        {propName(i.propertyId)} · {i.status}
-                      </div>
-                    </span>
-                  </li>
-                ))}
-            </ul>
-          )}
-        </section>
-      </div>
+      <section style={S.panel}>
+        <h3 style={S.panelTitle}>Checklistor att pricka av</h3>
+        {dueNow.length === 0 ? (
+          <EmptyNote text="Alla checklistor är avprickade för sina perioder. Bra läge." />
+        ) : (
+          <ul style={S.plainList}>
+            {dueNow.slice(0, 8).map((c) => (
+              <li key={c.template.id} style={S.rowItem}>
+                <span style={{ ...S.dot, background: c.missedPrev ? "#C4171C" : "#C49A2A" }} />
+                <span style={{ flex: 1 }}>
+                  <div style={S.rowTitle}>{c.template.title}</div>
+                  <div style={S.rowSub}>
+                    {propName(c.template.propertyId)} · {c.subText}
+                    {!c.dep && c.missedPrev ? " · även föregående missad" : ""}
+                  </div>
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
     </div>
   );
 }
@@ -5519,21 +5478,58 @@ function PrintableBasis({ basis, order, propertyName, propertyAddress, entries, 
 
 /* ------------------------------ backup ------------------------------ */
 
+// Läsbara namn för de datatyper som finns i appens tillstånd. Nycklar som inte
+// står med här visas ändå — då används själva nyckelnamnet. På så vis kommer
+// allt med i backupen automatiskt, även datatyper som läggs till i framtiden.
+const BACKUP_LABELS = {
+  organizations: "Föreningar",
+  properties: "Fastigheter",
+  tasks: "Uppgifter",
+  checklistTemplates: "Checklistor",
+  checklistRuns: "Checklist-avprickningar",
+  issues: "Ärenden",
+  billableOrders: "Ärenden (debitering)",
+  billableTimeEntries: "Tidrader",
+  invoiceBasis: "Faktureringsunderlag",
+  utilityReports: "Driftrapporter",
+  klimatdata: "Graddagar (klimatdata)",
+  rapportlogg: "Rapportlogg",
+  nextOrderNumber: "Nästa ordernummer",
+};
+
+// Beskriv varje toppnyckel i ett tillstånd oavsett typ. Listor räknas i antal,
+// objekt (t.ex. graddagar) i antal poster, och enkla värden visas som de är.
+// Kända nycklar kommer först i sin ordning, okända sist i bokstavsordning.
+const describeBackupState = (data) => {
+  if (!data || typeof data !== "object") return [];
+  const known = Object.keys(BACKUP_LABELS);
+  return Object.keys(data)
+    .sort((a, b) => {
+      const ia = known.indexOf(a);
+      const ib = known.indexOf(b);
+      if (ia === -1 && ib === -1) return a.localeCompare(b, "sv");
+      if (ia === -1) return 1;
+      if (ib === -1) return -1;
+      return ia - ib;
+    })
+    .map((key) => {
+      const val = data[key];
+      let count;
+      if (Array.isArray(val)) count = `${val.length} st`;
+      else if (val && typeof val === "object") count = `${Object.keys(val).length} poster`;
+      else count = String(val ?? "–");
+      return { key, label: BACKUP_LABELS[key] || key, count };
+    });
+};
+
 function Backup({ state, setState, notify, lastSavedAt }) {
   const [pendingImport, setPendingImport] = useState(null); // { data, summary, fileName }
   const [importError, setImportError] = useState(null);
   const fileInputRef = React.useRef(null);
 
-  const counts = {
-    Föreningar: (state.organizations || []).length,
-    Fastigheter: state.properties.length,
-    Uppgifter: state.tasks.length,
-    Checklistor: state.checklistTemplates.length,
-    Ärenden: state.issues.length,
-    "Ärenden (debitering)": (state.billableOrders || []).length,
-    Tidrader: (state.billableTimeEntries || []).length,
-    Faktureringsunderlag: (state.invoiceBasis || []).length,
-  };
+  // Byggs dynamiskt av allt som finns i tillståndet – inget behöver läggas till
+  // här manuellt när nya datatyper tillkommer.
+  const counts = describeBackupState(state);
 
   const downloadBackup = () => {
     const payload = { exportedAt: new Date().toISOString(), app: "N2 Fastighetsservice och Förvaltning AB", data: state };
@@ -5561,15 +5557,8 @@ function Backup({ state, setState, notify, lastSavedAt }) {
         if (!data || !Array.isArray(data.properties)) {
           throw new Error("Filen innehåller inte ett igenkännbart N2 Fastighetsservice och Förvaltning AB-underlag.");
         }
-        const summary = {
-          Föreningar: data.organizations?.length || 0,
-          Fastigheter: data.properties?.length || 0,
-          Uppgifter: data.tasks?.length || 0,
-          Checklistor: data.checklistTemplates?.length || 0,
-          Ärenden: data.issues?.length || 0,
-          "Ärenden (debitering)": data.billableOrders?.length || 0,
-          Faktureringsunderlag: data.invoiceBasis?.length || 0,
-        };
+        // Sammanfattningen speglar allt som finns i filen, inte en fast lista.
+        const summary = describeBackupState(data);
         setPendingImport({ data, summary, fileName: file.name });
       } catch (err) {
         setImportError("Kunde inte läsa filen. Kontrollera att det är en backup exporterad härifrån.");
@@ -5581,11 +5570,26 @@ function Backup({ state, setState, notify, lastSavedAt }) {
 
   const confirmImport = () => {
     if (!pendingImport) return;
+    const d = pendingImport.data;
+    // Återställ hela filens innehåll rakt av så inget faller bort – även
+    // datatyper som tillkommit efter att den här fliken byggdes. Listorna som
+    // appen alltid räknar med säkras med tomma standardvärden ifall en äldre
+    // backupfil skulle sakna någon av dem.
     setState({
-      ...pendingImport.data,
-      billableOrders: pendingImport.data.billableOrders || [],
-      billableTimeEntries: pendingImport.data.billableTimeEntries || [],
-      invoiceBasis: pendingImport.data.invoiceBasis || [],
+      ...d,
+      organizations: d.organizations || [],
+      properties: d.properties || [],
+      tasks: d.tasks || [],
+      checklistTemplates: d.checklistTemplates || [],
+      checklistRuns: d.checklistRuns || [],
+      issues: d.issues || [],
+      billableOrders: d.billableOrders || [],
+      billableTimeEntries: d.billableTimeEntries || [],
+      invoiceBasis: d.invoiceBasis || [],
+      utilityReports: d.utilityReports || [],
+      klimatdata: d.klimatdata || {},
+      rapportlogg: d.rapportlogg || [],
+      nextOrderNumber: d.nextOrderNumber || 1,
     });
     setPendingImport(null);
     notify("Backup återställd");
@@ -5603,10 +5607,10 @@ function Backup({ state, setState, notify, lastSavedAt }) {
       <div style={S.panel}>
         <h3 style={S.panelTitle}>Innehåll just nu</h3>
         <ul style={S.plainList}>
-          {Object.entries(counts).map(([label, n]) => (
-            <li key={label} style={{ ...S.rowItem, alignItems: "center" }}>
+          {counts.map(({ key, label, count }) => (
+            <li key={key} style={{ ...S.rowItem, alignItems: "center" }}>
               <span style={{ flex: 1, fontSize: 13.5 }}>{label}</span>
-              <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 13 }}>{n}</span>
+              <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 13 }}>{count}</span>
             </li>
           ))}
         </ul>
@@ -5620,8 +5624,9 @@ function Backup({ state, setState, notify, lastSavedAt }) {
       <div style={S.panel}>
         <h3 style={S.panelTitle}>Ladda ner backup</h3>
         <p style={{ ...S.rowSub, marginBottom: 12 }}>
-          Sparar all information (föreningar, fastigheter, uppgifter, checklistor, ärenden, debitering) som en
-          JSON-fil på din enhet.
+          Sparar <strong>allt</strong> som finns i appen — föreningar, fastigheter, uppgifter, checklistor och
+          avprickningar, ärenden, debitering, faktureringsunderlag, driftrapporter, graddagar och loggar — som en
+          JSON-fil på din enhet. Listan här ovanför visar precis vad som kommer med.
         </p>
         <button style={S.primaryBtn} className="fk-btn" onClick={downloadBackup}>
           Ladda ner backup (.json)
@@ -5652,10 +5657,10 @@ function Backup({ state, setState, notify, lastSavedAt }) {
           <div style={S.taskCardTitle}>Bekräfta återställning</div>
           <div style={S.rowSub}>Fil: {pendingImport.fileName}</div>
           <ul style={S.plainList}>
-            {Object.entries(pendingImport.summary).map(([label, n]) => (
-              <li key={label} style={{ ...S.rowItem, alignItems: "center" }}>
+            {pendingImport.summary.map(({ key, label, count }) => (
+              <li key={key} style={{ ...S.rowItem, alignItems: "center" }}>
                 <span style={{ flex: 1, fontSize: 13.5 }}>{label}</span>
-                <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 13 }}>{n}</span>
+                <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 13 }}>{count}</span>
               </li>
             ))}
           </ul>
@@ -5675,9 +5680,6 @@ function Backup({ state, setState, notify, lastSavedAt }) {
     </div>
   );
 }
-
-/* ------------------------------ kalender ------------------------------ */
-
 
 /* ------------------------------ driftrapporter ------------------------------ */
 
@@ -7657,104 +7659,6 @@ function buildDriftrapportExcel(reports, org, allReports, state) {
   XLSX.writeFile(workbook, `driftrapport-${propertyName.replace(/\s+/g, "-").toLowerCase()}.xlsx`);
 }
 
-/* ------------------------------ kalender ------------------------------ */
-
-function Kalender({ state, scopedProps }) {
-  const [monthOffset, setMonthOffset] = useState(0);
-  const ids = new Set(scopedProps.map((p) => p.id));
-  const tasks = state.tasks.filter((t) => ids.has(t.propertyId));
-  const propName = (id) => state.properties.find((p) => p.id === id)?.name || "";
-
-  const base = new Date();
-  base.setDate(1);
-  base.setMonth(base.getMonth() + monthOffset);
-  const year = base.getFullYear();
-  const month = base.getMonth();
-  const firstWeekday = (new Date(year, month, 1).getDay() + 6) % 7; // Monday-first
-  const daysInMonth = new Date(year, month + 1, 0).getDate();
-
-  const byDate = useMemo(() => {
-    const map = {};
-    tasks.forEach((t) => {
-      map[t.nextDue] = map[t.nextDue] || [];
-      map[t.nextDue].push(t);
-    });
-    return map;
-  }, [tasks]);
-
-  const [selected, setSelected] = useState(null);
-  const cells = [];
-  for (let i = 0; i < firstWeekday; i++) cells.push(null);
-  for (let d = 1; d <= daysInMonth; d++) cells.push(d);
-
-  const monthLabel = base.toLocaleDateString("sv-SE", { month: "long", year: "numeric" });
-  const isoFor = (d) => `${year}-${String(month + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
-  const today = todayISO();
-
-  return (
-    <div style={{ animation: "fk-rise .25s ease" }}>
-      <div style={S.sectionHead}>
-        <h2 style={S.h2}>Kalender & påminnelser</h2>
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <button style={S.navBtn} onClick={() => setMonthOffset((m) => m - 1)}>‹</button>
-          <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 13, textTransform: "capitalize" }}>
-            {monthLabel}
-          </span>
-          <button style={S.navBtn} onClick={() => setMonthOffset((m) => m + 1)}>›</button>
-        </div>
-      </div>
-
-      <div style={S.calGrid}>
-        {["Mån", "Tis", "Ons", "Tor", "Fre", "Lör", "Sön"].map((d) => (
-          <div key={d} style={S.calWeekday}>{d}</div>
-        ))}
-        {cells.map((d, idx) => {
-          if (d === null) return <div key={idx} />;
-          const iso = isoFor(d);
-          const items = byDate[iso] || [];
-          const isToday = iso === today;
-          return (
-            <button
-              key={idx}
-              onClick={() => setSelected(iso)}
-              style={{
-                ...S.calCell,
-                ...(isToday ? S.calCellToday : {}),
-                ...(selected === iso ? S.calCellSelected : {}),
-              }}
-            >
-              <span>{d}</span>
-              {items.length > 0 && (
-                <span style={{ ...S.calDot, background: iso < today ? "#C4171C" : "#3A413C" }} />
-              )}
-            </button>
-          );
-        })}
-      </div>
-
-      <div style={S.panel}>
-        <h3 style={S.panelTitle}>
-          {selected ? `Förfaller ${fmtDate(selected)}` : "Välj en dag med markering"}
-        </h3>
-        {selected && (byDate[selected] || []).length === 0 && <EmptyNote text="Inget förfaller denna dag." />}
-        {selected && (
-          <ul style={S.plainList}>
-            {(byDate[selected] || []).map((t) => (
-              <li key={t.id} style={S.rowItem}>
-                <span style={{ ...S.dot, background: "#3A413C" }} />
-                <span style={{ flex: 1 }}>
-                  <div style={S.rowTitle}>{t.title}</div>
-                  <div style={S.rowSub}>{propName(t.propertyId)} · {t.category}</div>
-                </span>
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
-    </div>
-  );
-}
-
 /* ------------------------------ styles ------------------------------ */
 
 const S = {
@@ -8250,26 +8154,6 @@ const S = {
   invoiceTh: { textAlign: "left", borderBottom: "1.5px solid #1C2321", padding: "6px 8px", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, color: "#5C594E" },
   invoiceTd: { borderBottom: "1px solid #C9C4B7", padding: "10px 8px" },
   invoiceTotal: { textAlign: "right", fontFamily: "'IBM Plex Mono', monospace", fontSize: 18, fontWeight: 600, marginTop: 16 },
-
-  navBtn: { border: "1px solid #C9C4B7", background: "#FFFFFF", borderRadius: 6, width: 28, height: 28, fontSize: 16, lineHeight: 1 },
-  calGrid: { display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 4, marginBottom: 16 },
-  calWeekday: { fontSize: 10.5, color: "#8a8578", textAlign: "center", textTransform: "uppercase", letterSpacing: 0.5, paddingBottom: 4 },
-  calCell: {
-    aspectRatio: "1",
-    border: "1px solid #C9C4B7",
-    background: "#FFFFFF",
-    borderRadius: 6,
-    display: "flex",
-    flexDirection: "column",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 3,
-    fontSize: 12.5,
-    position: "relative",
-  },
-  calCellToday: { borderColor: "#1C2321", borderWidth: 2, fontWeight: 700 },
-  calCellSelected: { background: "#1C2321", color: "#EDEAE1" },
-  calDot: { width: 6, height: 6, borderRadius: "50%" },
 
   errorBar: { position: "fixed", bottom: 0, left: 0, right: 0, background: "#C4171C", color: "#fff", textAlign: "center", padding: "10px 12px", fontSize: 13, display: "flex", flexDirection: "column", alignItems: "center", gap: 8 },
   retryBtn: { background: "#fff", color: "#C4171C", border: "none", borderRadius: 6, padding: "6px 12px", fontSize: 12.5, fontWeight: 700 },

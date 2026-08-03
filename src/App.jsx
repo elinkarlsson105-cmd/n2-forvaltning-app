@@ -7843,8 +7843,8 @@ const S = {
 
   formPanel: { background: "#FFFFFF", border: "1px solid #C9C4B7", borderRadius: 8, padding: 16, marginBottom: 16, display: "flex", flexDirection: "column", gap: 12 },
   formRow: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 },
-  label: { display: "flex", flexDirection: "column", gap: 5, fontSize: 12.5, color: "#5C594E", fontWeight: 500 },
-  input: { border: "1px solid #C9C4B7", borderRadius: 6, padding: "8px 10px", fontSize: 13.5, color: "#1C2321", background: "#FBFAF7" },
+  label: { display: "flex", flexDirection: "column", gap: 5, fontSize: 12.5, color: "#5C594E", fontWeight: 500, minWidth: 0 },
+  input: { border: "1px solid #C9C4B7", borderRadius: 6, padding: "8px 10px", fontSize: 13.5, color: "#1C2321", background: "#FBFAF7", width: "100%", minWidth: 0 },
 
   // Inramade avsnitt i driftrapportformuläret — samma vita box som panel/
   // föreningskortet, med en tydlig rubrik till vänster.

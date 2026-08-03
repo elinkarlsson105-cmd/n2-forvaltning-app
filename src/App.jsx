@@ -1223,11 +1223,30 @@ function LoginScreen() {
   );
 }
 
+// Känner av om appen körs som installerad app (hemskärm/PWA i standalone-läge)
+// i stället för i en vanlig webbläsarflik. På iPhone exponeras detta via
+// navigator.standalone; på övriga plattformar via display-mode: standalone.
+// När appen öppnas "via internet" (vanlig flik) blir detta false och den
+// klassiska flikraden visas som förut.
+function detectStandalone() {
+  if (typeof window === "undefined") return false;
+  const mm =
+    typeof window.matchMedia === "function" &&
+    (window.matchMedia("(display-mode: standalone)").matches ||
+      window.matchMedia("(display-mode: fullscreen)").matches ||
+      window.matchMedia("(display-mode: minimal-ui)").matches);
+  return mm || window.navigator.standalone === true;
+}
+
 function AuthenticatedApp({ session }) {
   const { state, setState, loading, saving, error, retry, lastSavedAt } = useAppState();
   const [propertyId, setPropertyId] = useState("all");
   const actorName = session.user.email;
   const [tab, setTab] = useState("oversikt");
+  // Standalone-läget avgörs vid start och styr om navigeringen visas som
+  // hamburgermeny (installerad app) eller som flikrad (webbläsare).
+  const [isStandalone] = useState(detectStandalone);
+  const [menuOpen, setMenuOpen] = useState(false);
   const [toast, setToast] = useState(null);
   const [orgModal, setOrgModal] = useState(null); // null | "list" | "add" | { editId }
 
@@ -1429,18 +1448,59 @@ function AuthenticatedApp({ session }) {
         </main>
       ) : (
         <>
-          <nav style={S.tabRow} className="fk-scroll">
-            {tabs.map((t) => (
-              <button
-                key={t.id}
-                className="fk-tab-btn"
-                onClick={() => setTab(t.id)}
-                style={{ ...S.tabBtn, ...(tab === t.id ? S.tabBtnActive : {}) }}
-              >
-                {t.label}
-              </button>
-            ))}
-          </nav>
+          {isStandalone ? (
+            <div style={S.menuBarWrap}>
+              <div style={S.menuBar}>
+                <button
+                  type="button"
+                  className="fk-btn"
+                  onClick={() => setMenuOpen((o) => !o)}
+                  style={S.hamburgerBtn}
+                  aria-label={menuOpen ? "Stäng meny" : "Öppna meny"}
+                  aria-expanded={menuOpen}
+                >
+                  <span style={S.hamburgerIcon}>{menuOpen ? "✕" : "☰"}</span>
+                  <span style={S.menuBarLabel}>
+                    {tabs.find((t) => t.id === tab)?.label || "Meny"}
+                  </span>
+                </button>
+              </div>
+              {menuOpen && (
+                <>
+                  <div style={S.menuBackdrop} onClick={() => setMenuOpen(false)} />
+                  <nav style={S.menuPanel} className="fk-scroll">
+                    {tabs.map((t) => (
+                      <button
+                        key={t.id}
+                        type="button"
+                        className="fk-tab-btn"
+                        onClick={() => {
+                          setTab(t.id);
+                          setMenuOpen(false);
+                        }}
+                        style={{ ...S.menuItem, ...(tab === t.id ? S.menuItemActive : {}) }}
+                      >
+                        {t.label}
+                      </button>
+                    ))}
+                  </nav>
+                </>
+              )}
+            </div>
+          ) : (
+            <nav style={S.tabRow} className="fk-scroll">
+              {tabs.map((t) => (
+                <button
+                  key={t.id}
+                  className="fk-tab-btn"
+                  onClick={() => setTab(t.id)}
+                  style={{ ...S.tabBtn, ...(tab === t.id ? S.tabBtnActive : {}) }}
+                >
+                  {t.label}
+                </button>
+              ))}
+            </nav>
+          )}
 
           <main style={S.main} className="fk-scroll">
             {tab === "oversikt" && (
@@ -7674,6 +7734,81 @@ const S = {
     whiteSpace: "nowrap",
   },
   tabBtnActive: { color: "#1C2321", borderBottom: "3px solid #3A413C" },
+
+  // Hamburgermeny — visas i stället för flikraden när appen körs som
+  // installerad app (standalone/PWA).
+  menuBarWrap: {
+    position: "relative",
+    background: "#EDEAE1",
+    borderBottom: "1px solid #C9C4B7",
+  },
+  menuBar: {
+    display: "flex",
+    alignItems: "center",
+    padding: "6px 12px",
+  },
+  hamburgerBtn: {
+    display: "flex",
+    alignItems: "center",
+    gap: 12,
+    background: "transparent",
+    border: "none",
+    padding: "8px 6px",
+    color: "#1C2321",
+  },
+  hamburgerIcon: {
+    fontSize: 22,
+    lineHeight: 1,
+    width: 24,
+    textAlign: "center",
+    color: "#3A413C",
+  },
+  menuBarLabel: {
+    fontFamily: "'Oswald', sans-serif",
+    fontSize: 16,
+    fontWeight: 600,
+    letterSpacing: 0.3,
+  },
+  menuBackdrop: {
+    position: "fixed",
+    inset: 0,
+    zIndex: 39,
+    background: "transparent",
+  },
+  menuPanel: {
+    position: "absolute",
+    top: "100%",
+    left: 0,
+    right: 0,
+    zIndex: 40,
+    background: "#EDEAE1",
+    borderBottom: "1px solid #C9C4B7",
+    boxShadow: "0 12px 24px rgba(28, 35, 33, 0.18)",
+    display: "flex",
+    flexDirection: "column",
+    padding: "6px 8px 10px",
+    maxHeight: "70vh",
+    overflowY: "auto",
+    animation: "fk-rise .16s ease",
+  },
+  menuItem: {
+    border: "none",
+    background: "transparent",
+    textAlign: "left",
+    padding: "13px 14px",
+    borderRadius: 6,
+    fontFamily: "'Oswald', sans-serif",
+    fontSize: 15,
+    letterSpacing: 0.3,
+    color: "#5C594E",
+    borderLeft: "3px solid transparent",
+  },
+  menuItemActive: {
+    color: "#1C2321",
+    background: "#DBD7CB",
+    borderLeft: "3px solid #3A413C",
+  },
+
   main: { padding: "18px", flex: 1, overflowY: "auto", maxWidth: 1040, margin: "0 auto", width: "100%" },
 
   statGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 10, marginBottom: 18 },

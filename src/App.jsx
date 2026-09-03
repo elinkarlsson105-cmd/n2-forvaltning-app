@@ -4268,6 +4268,14 @@ function Debitering({ state, scopedProps, billing, notify }) {
   const [filterProperty, setFilterProperty] = useState("alla");
   const [nyckeltalOpen, setNyckeltalOpen] = useState(false);
   const [filterOpen, setFilterOpen] = useState(false);
+  // Vilka orderkort som är utfällda i listorna (kompakt vy, som Ärenden-fliken).
+  const [expandedRows, setExpandedRows] = useState(() => new Set());
+  const toggleRow = (id) =>
+    setExpandedRows((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
 
   const ids = new Set(scopedProps.map((p) => p.id));
   const showPropertyTag = scopedProps.length > 1;
@@ -4522,6 +4530,8 @@ function Debitering({ state, scopedProps, billing, notify }) {
               order={o}
               billing={billing}
               propertyName={showPropertyTag ? propName(o.propertyId) : null}
+              isOpen={expandedRows.has(o.id)}
+              onToggle={() => toggleRow(o.id)}
               onOpen={() => setOpenOrderId(o.id)}
             />
           ))}
@@ -4537,71 +4547,98 @@ function Debitering({ state, scopedProps, billing, notify }) {
             date: o.completedAt,
             hours: orderInvoicedHours(o.id),
             amount: orderInvoicedAmount(o.id),
-          })).map((o) => (
-              <div key={o.id} style={S.checklistCardInvoiced}>
-                <div style={S.checklistHead}>
-                  <div>
-                    <div style={S.taskCardTitle}>
-                      <span style={S.orderNumberTag}>#{o.orderNumber}</span> {o.title}
-                      <span style={S.typeTag}>
-                        {o.type === "felanmalan" ? "Felanmälan" : "Tilläggstjänst"}
+          })).map((o) => {
+              const isOpen = expandedRows.has(o.id);
+              const stillUnbilled = billing.unbilledHours(o.id) > 0 || billing.unbilledPurchaseCost(o.id) > 0;
+              return (
+                <div key={o.id} style={{ ...S.issueCard, background: "#F5FBF6", borderColor: "#C3E4C6" }}>
+                  {/* Kompakt rad — klicka för att fälla ut underlaget. */}
+                  <div style={S.issueRow} onClick={() => toggleRow(o.id)}>
+                    <span style={{ ...S.issueChevron, transform: isOpen ? "rotate(90deg)" : "none" }}>▸</span>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={S.issueTitle}>
+                        <span style={S.orderNumberTag}>#{o.orderNumber}</span> {o.title}
+                        <span style={S.typeTag}>{o.type === "felanmalan" ? "Felanmälan" : "Tilläggstjänst"}</span>
+                        {showPropertyTag && <span style={S.propertyTag}>{propName(o.propertyId)}</span>}
+                      </div>
+                      <div style={S.issueMeta}>
+                        Inkom {fmtDate(o.reportedDate)} · klarmarkerad {fmtDate(o.completedAt)}
+                      </div>
+                    </div>
+                    {stillUnbilled ? (
+                      <span style={{ ...S.statusPill, whiteSpace: "nowrap" }}>Delvis fakturerat</span>
+                    ) : (
+                      <span style={{ ...S.statusPill, background: "#2B6E5E", color: "#FFFFFF", borderColor: "#2B6E5E", whiteSpace: "nowrap" }}>
+                        Fakturerat
                       </span>
-                      {showPropertyTag && <span style={S.propertyTag}>{propName(o.propertyId)}</span>}
-                    </div>
-                    <div style={S.taskCardProp}>
-                      Inkom {fmtDate(o.reportedDate)} · klarmarkerad {fmtDate(o.completedAt)}
-                    </div>
+                    )}
                   </div>
+
+                  {isOpen && (
+                    <div style={S.issueDetails}>
+                      <div style={{ ...S.rowSub, marginTop: 0 }}>
+                        {orderInvoicedHours(o.id)} h fakturerat · {orderInvoicedAmount(o.id).toLocaleString("sv-SE")} kr
+                        {o.billCount > 0 && ` · Bil ${o.billCount} st`}
+                        {orderInvoicedPurchase(o.id) > 0 && ` · varav inköp ${orderInvoicedPurchase(o.id).toLocaleString("sv-SE")} kr`}
+                        {billing.unbilledHours(o.id) > 0 && ` · ${billing.unbilledHours(o.id)} h kvar att fakturera`}
+                        {billing.unbilledPurchaseCost(o.id) > 0 && ` · inköp kvar att fakturera`}
+                      </div>
+                      <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+                        <button style={S.stampBtn} className="fk-btn" onClick={() => setOpenOrderId(o.id)}>
+                          Visa underlag
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </div>
-                <div style={S.issueFooter}>
-                  <span style={S.rowSub}>
-                    {orderInvoicedHours(o.id)} h fakturerat · {orderInvoicedAmount(o.id).toLocaleString("sv-SE")} kr
-                    {o.billCount > 0 && ` · Bil ${o.billCount} st`}
-                    {orderInvoicedPurchase(o.id) > 0 && ` · varav inköp ${orderInvoicedPurchase(o.id).toLocaleString("sv-SE")} kr`}
-                    {billing.unbilledHours(o.id) > 0 && ` · ${billing.unbilledHours(o.id)} h kvar att fakturera`}
-                    {billing.unbilledPurchaseCost(o.id) > 0 && ` · inköp kvar att fakturera`}
-                  </span>
-                  <button style={S.stampBtn} className="fk-btn" onClick={() => setOpenOrderId(o.id)}>
-                    Visa underlag
-                  </button>
-                </div>
-              </div>
-            ))}
+              );
+            })}
         </div>
       )}
     </div>
   );
 }
 
-function DebiteringOrderCard({ order: o, billing, propertyName, onOpen }) {
+function DebiteringOrderCard({ order: o, billing, propertyName, isOpen, onToggle, onOpen }) {
   const logged = billing.loggedHours(o.id);
   const unbilled = billing.unbilledHours(o.id);
   const unbilledPurchase = billing.unbilledPurchaseCost(o.id);
+  const unbilledAmount = unbilled * billing.rateFor(o) + unbilledPurchase;
   return (
-    <div style={S.checklistCardPending}>
-      <div style={S.checklistHead}>
-        <div>
-          <div style={S.taskCardTitle}>
+    <div style={{ ...S.issueCard, background: "#FFFDF3", borderColor: "#F0E4A8" }}>
+      {/* Kompakt rad — klicka för att fälla ut detaljer och åtgärd. */}
+      <div style={S.issueRow} onClick={onToggle}>
+        <span style={{ ...S.issueChevron, transform: isOpen ? "rotate(90deg)" : "none" }}>▸</span>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={S.issueTitle}>
             <span style={S.orderNumberTag}>#{o.orderNumber}</span> {o.title}
             <span style={S.typeTag}>{o.type === "felanmalan" ? "Felanmälan" : "Tilläggstjänst"}</span>
             {propertyName && <span style={S.propertyTag}>{propertyName}</span>}
           </div>
-          <div style={S.taskCardProp}>
+          <div style={S.issueMeta}>
             Inkom {fmtDate(o.reportedDate)} · klarmarkerad {fmtDate(o.completedAt)}
           </div>
-          {o.description && <div style={{ ...S.rowSub, marginTop: 6 }}>{o.description}</div>}
         </div>
-      </div>
-      <div style={S.issueFooter}>
-        <span style={S.rowSub}>
-          {logged} h loggat · {unbilled} h att fakturera{o.priceCategory ? ` · ${o.priceCategory} (${billing.rateFor(o)} kr/h)` : ""}
-          {o.billCount > 0 && ` · Bil ${o.billCount} st`}
-          {unbilledPurchase > 0 && ` · Inköp ${unbilledPurchase.toLocaleString("sv-SE")} kr att fakturera`}
+        <span style={{ ...S.statusPill, whiteSpace: "nowrap", fontWeight: 600 }}>
+          {unbilledAmount.toLocaleString("sv-SE")} kr
         </span>
-        <button style={S.stampBtn} className="fk-btn" onClick={onOpen}>
-          Hantera fakturering
-        </button>
       </div>
+
+      {isOpen && (
+        <div style={S.issueDetails}>
+          {o.description && <div style={{ ...S.rowSub, marginTop: 0 }}>{o.description}</div>}
+          <div style={{ ...S.rowSub, marginTop: 8 }}>
+            {logged} h loggat · {unbilled} h att fakturera{o.priceCategory ? ` · ${o.priceCategory} (${billing.rateFor(o)} kr/h)` : ""}
+            {o.billCount > 0 && ` · Bil ${o.billCount} st`}
+            {unbilledPurchase > 0 && ` · Inköp ${unbilledPurchase.toLocaleString("sv-SE")} kr att fakturera`}
+          </div>
+          <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+            <button style={S.stampBtn} className="fk-btn" onClick={onOpen}>
+              Hantera fakturering
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -6966,6 +7003,14 @@ function Driftrapporter({ state, setState, scopedProps, selectedOrg, actor, noti
   // Klarmarkerade rapporter måste låsas upp först — annars kan en styrelse-
   // rapporterad månad försvinna spårlöst.
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+  // Vilka rapportkort som är utfällda i listan (kompakt vy, som övriga flikar).
+  const [expandedRows, setExpandedRows] = useState(() => new Set());
+  const toggleRow = (id) =>
+    setExpandedRows((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
   const removeReport = (r) => {
     if (r.klar) {
       notify("Rapporten är klarmarkerad — lås upp den först innan den kan raderas");
@@ -7161,43 +7206,58 @@ function Driftrapporter({ state, setState, scopedProps, selectedOrg, actor, noti
             const elCons = metersTotalConsumption(allReports, r, "elMeters");
             const waterTot = metersTotalValue(r, "waterMeters");
             const elTot = metersTotalValue(r, "elMeters");
+            const dhK = dhEffective(allReports, r) != null ? dhKpis(state, allReports, org, r) : null;
+            const summaryParts = [];
+            if (waterTot != null) summaryParts.push(`Vatten ${waterTot} m³`);
+            if (elTot != null) summaryParts.push(`El ${elTot} kWh`);
+            if (dhK) summaryParts.push(`Fjärrvärme ${fmtNum(dhK.mwh)} MWh`);
+            const summaryLine = summaryParts.join(" · ") || "Inga mätvärden registrerade";
+            const isOpen = expandedRows.has(r.id);
             return (
               <div
                 key={r.id}
                 style={{
-                  ...S.checklistCard,
-                  ...(r.klar ? { background: "#EAF3EA", borderColor: "#2B6E5E" } : {}),
+                  ...S.issueCard,
+                  ...(r.klar ? { background: "#F5FBF6", borderColor: "#C3E4C6" } : {}),
                 }}
               >
-                <div style={S.checklistHead}>
-                  <div>
-                    <div style={S.taskCardTitle}>
+                {/* Kompakt rad — klicka för att fälla ut alla mätvärden och åtgärder. */}
+                <div style={S.issueRow} onClick={() => toggleRow(r.id)}>
+                  <span style={{ ...S.issueChevron, transform: isOpen ? "rotate(90deg)" : "none" }}>▸</span>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={S.issueTitle}>
                       {monthLabel(r.month)}
                       {showPropertyTag && <span style={S.propertyTag}>{propName(r.propertyId)}</span>}
-                      {r.klar && (
-                        <span style={{ marginLeft: 8, fontSize: 12, fontWeight: 600, color: "#2B6E5E" }}>
-                          ✓ Klarmarkerad{r.klarAt ? ` ${fmtDate(r.klarAt)}` : ""}{r.klarAv ? ` av ${r.klarAv}` : ""}
-                        </span>
-                      )}
-                      {!r.klar && (
-                        <span style={{ marginLeft: 8, fontSize: 12, fontWeight: 600, color: "#8a8578" }}>
-                          Utkast
-                        </span>
-                      )}
                     </div>
-                    <div style={{ ...S.rowSub, marginTop: 4 }}>
+                    <div style={S.issueMeta}>{summaryLine}</div>
+                  </div>
+                  {r.klar ? (
+                    <span style={{ ...S.statusPill, background: "#2B6E5E", color: "#FFFFFF", borderColor: "#2B6E5E", whiteSpace: "nowrap" }}>
+                      Klarmarkerad
+                    </span>
+                  ) : (
+                    <span style={{ ...S.statusPill, whiteSpace: "nowrap" }}>Utkast</span>
+                  )}
+                </div>
+
+                {isOpen && (
+                  <div style={S.issueDetails}>
+                    {r.klar && (
+                      <div style={{ ...S.rowSub, marginTop: 0, color: "#2B6E5E", fontWeight: 600 }}>
+                        ✓ Klarmarkerad{r.klarAt ? ` ${fmtDate(r.klarAt)}` : ""}{r.klarAv ? ` av ${r.klarAv}` : ""}
+                      </div>
+                    )}
+                    <div style={{ ...S.rowSub, marginTop: r.klar ? 6 : 0 }}>
                       {waterTot != null && (
                         <><strong>Vatten:</strong> {waterTot} m³{(r.waterMeters || []).length > 1 ? ` (${r.waterMeters.length} mätare)` : ""}{waterCons != null ? ` · ${waterCons >= 0 ? "+" : ""}${waterCons} m³ sedan förra mån.` : ""}<br /></>
                       )}
                       {elTot != null && (
                         <><strong>El:</strong> {elTot} kWh{(r.elMeters || []).length > 1 ? ` (${r.elMeters.length} mätare)` : ""}{elCons != null ? ` · ${elCons >= 0 ? "+" : ""}${elCons} kWh sedan förra mån.` : ""}<br /></>
                       )}
-                      {dhEffective(allReports, r) != null && (() => {
-                        const k = dhKpis(state, allReports, org, r);
-                        if (!k) return null;
-                        const parts = [`${fmtNum(k.mwh)} MWh`];
-                        if (k.m3 != null) parts.push(`${fmtNum(k.m3, 0)} m³`);
-                        if (k.qw != null) parts.push(`Q/W ${fmtNum(k.qw)}`);
+                      {dhK && (() => {
+                        const parts = [`${fmtNum(dhK.mwh)} MWh`];
+                        if (dhK.m3 != null) parts.push(`${fmtNum(dhK.m3, 0)} m³`);
+                        if (dhK.qw != null) parts.push(`Q/W ${fmtNum(dhK.qw)}`);
                         return <><strong>Fjärrvärme:</strong> {parts.join(" · ")}</>;
                       })()}
                     </div>
@@ -7220,83 +7280,85 @@ function Driftrapporter({ state, setState, scopedProps, selectedOrg, actor, noti
                     {r.atgard && <div style={{ ...S.rowSub, marginTop: 4 }}>Rekommenderad åtgärd: {r.atgard}</div>}
                     {r.note && <div style={{ ...S.rowSub, marginTop: 4 }}>{r.note}</div>}
                     <div style={{ ...S.rowSub, marginTop: 4 }}>Registrerad av {r.recordedBy}</div>
-                  </div>
-                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-start" }}>
-                    {r.klar ? (
-                      <button style={S.secondaryBtnSmall || S.secondaryBtn} className="fk-btn" onClick={() => { setUnlockingId(r.id); setUnlockReason(""); }}>
-                        Lås upp
-                      </button>
-                    ) : (
-                      <button
-                        style={{ ...S.stampBtn, background: "#2B6E5E" }}
-                        className="fk-btn"
-                        onClick={() => markKlar(r)}
-                      >
-                        Klarmarkera
-                      </button>
+
+                    {(r.laslogg || []).length > 0 && (
+                      <div style={{ ...S.rowSub, marginTop: 8, fontSize: 12 }}>
+                        <div style={{ fontWeight: 600, marginBottom: 2 }}>Logg</div>
+                        {(r.laslogg || []).map((l, i) => (
+                          <div key={i} style={{ marginBottom: 2 }}>
+                            {l.handelse} {fmtDate(l.datum)} av {l.av}
+                            {l.kommentar ? <span style={{ color: "#B07A16" }}> — {l.kommentar}</span> : null}
+                          </div>
+                        ))}
+                      </div>
                     )}
-                    {!r.klar && (
-                      confirmDeleteId === r.id ? (
-                        <button
-                          style={{ ...S.stampBtn, background: "#C4171C" }}
-                          className="fk-btn"
-                          onClick={() => removeReport(r)}
-                        >
-                          Bekräfta radering
+
+                    {unlockingId === r.id && (
+                      <div style={{ marginTop: 10, padding: "10px 12px", border: "1px solid #C9C4B7", borderRadius: 8 }}>
+                        <div style={{ ...S.rowSub, marginBottom: 6 }}>
+                          Ange varför rapporten låses upp — det sparas i loggen tillsammans med vem och när.
+                        </div>
+                        <input
+                          className="fk-input"
+                          style={S.input}
+                          value={unlockReason}
+                          onChange={(e) => setUnlockReason(e.target.value)}
+                          placeholder="t.ex. Justering av felavläst mätarställning"
+                          autoFocus
+                        />
+                        <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+                          <button
+                            style={{ ...S.stampBtn, background: "#2B6E5E", opacity: unlockReason.trim() ? 1 : 0.5 }}
+                            className="fk-btn"
+                            disabled={!unlockReason.trim()}
+                            onClick={() => unlockKlar(r, unlockReason)}
+                          >
+                            Bekräfta upplåsning
+                          </button>
+                          <button style={S.linkBtn} className="fk-btn" onClick={() => { setUnlockingId(null); setUnlockReason(""); }}>
+                            Avbryt
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
+                      {r.klar ? (
+                        <button style={S.secondaryBtnSmall || S.secondaryBtn} className="fk-btn" onClick={() => { setUnlockingId(r.id); setUnlockReason(""); }}>
+                          Lås upp
                         </button>
                       ) : (
-                        <button style={S.miniDelete} onClick={() => setConfirmDeleteId(r.id)} aria-label="Radera driftrapport">×</button>
-                      )
-                    )}
-                  </div>
-                </div>
-
-                {unlockingId === r.id && (
-                  <div style={{ marginTop: 10, padding: "10px 12px", border: "1px solid #C9C4B7", borderRadius: 8 }}>
-                    <div style={{ ...S.rowSub, marginBottom: 6 }}>
-                      Ange varför rapporten låses upp — det sparas i loggen tillsammans med vem och när.
+                        <>
+                          <button
+                            style={{ ...S.stampBtn, background: "#2B6E5E" }}
+                            className="fk-btn"
+                            onClick={() => markKlar(r)}
+                          >
+                            Klarmarkera
+                          </button>
+                          <button style={S.stampBtn} className="fk-btn" onClick={() => startEdit(r)}>
+                            Redigera
+                          </button>
+                          {confirmDeleteId === r.id ? (
+                            <button
+                              style={{ ...S.stampBtn, background: "#C4171C" }}
+                              className="fk-btn"
+                              onClick={() => removeReport(r)}
+                            >
+                              Bekräfta radering
+                            </button>
+                          ) : (
+                            <button
+                              style={{ ...S.secondaryBtnSmall, color: "#C4171C", borderColor: "#E0B4B2" }}
+                              className="fk-btn"
+                              onClick={() => setConfirmDeleteId(r.id)}
+                            >
+                              Radera
+                            </button>
+                          )}
+                        </>
+                      )}
                     </div>
-                    <input
-                      className="fk-input"
-                      style={S.input}
-                      value={unlockReason}
-                      onChange={(e) => setUnlockReason(e.target.value)}
-                      placeholder="t.ex. Justering av felavläst mätarställning"
-                      autoFocus
-                    />
-                    <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
-                      <button
-                        style={{ ...S.stampBtn, background: "#2B6E5E", opacity: unlockReason.trim() ? 1 : 0.5 }}
-                        className="fk-btn"
-                        disabled={!unlockReason.trim()}
-                        onClick={() => unlockKlar(r, unlockReason)}
-                      >
-                        Bekräfta upplåsning
-                      </button>
-                      <button style={S.linkBtn} className="fk-btn" onClick={() => { setUnlockingId(null); setUnlockReason(""); }}>
-                        Avbryt
-                      </button>
-                    </div>
-                  </div>
-                )}
-
-                {(r.laslogg || []).length > 0 && (
-                  <div style={{ ...S.rowSub, marginTop: 6, fontSize: 12 }}>
-                    <div style={{ fontWeight: 600, marginBottom: 2 }}>Logg</div>
-                    {(r.laslogg || []).map((l, i) => (
-                      <div key={i} style={{ marginBottom: 2 }}>
-                        {l.handelse} {fmtDate(l.datum)} av {l.av}
-                        {l.kommentar ? <span style={{ color: "#B07A16" }}> — {l.kommentar}</span> : null}
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {!r.klar && (
-                  <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 10 }}>
-                    <button style={S.stampBtn} className="fk-btn" onClick={() => startEdit(r)}>
-                      Redigera
-                    </button>
                   </div>
                 )}
               </div>

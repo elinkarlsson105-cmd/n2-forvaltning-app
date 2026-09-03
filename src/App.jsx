@@ -91,9 +91,10 @@ function SortFilterBar({
   filterProperty,
   setFilterProperty,
   properties,
+  bare = false,
 }) {
   return (
-    <div style={S.sortFilterBar}>
+    <div style={bare ? S.sortFilterBarBare : S.sortFilterBar}>
       <label style={S.sortFilterField}>
         <span style={S.sortFilterLabel}>Sortera</span>
         <select className="fk-input" style={S.sortFilterSelect} value={sortBy} onChange={(e) => setSortBy(e.target.value)}>
@@ -194,6 +195,7 @@ const seedState = () => {
   issues: [],
   billableOrders: [],
   billableTimeEntries: [],
+  billablePurchases: [],
   invoiceBasis: [],
   nextOrderNumber: 1,
   utilityReports: [],
@@ -226,6 +228,10 @@ const normalizeOrganization = (o) => ({
     TEK: Number(o.rates?.TEK || 0),
     BIL: Number(o.rates?.BIL || 0),
   },
+  // Materialpåslag på inköp (%) — det pålägg som inköp räknas upp med när ett
+  // faktureringsunderlag skapas. Kan bockas ur per inköpsrad i underlaget.
+  // Standard 10 % om inget annat angetts för föreningen.
+  purchaseMarkupPct: Number.isFinite(Number(o.purchaseMarkupPct)) ? Number(o.purchaseMarkupPct) : 10,
   // ENERGIN LIGGER PÅ FÖRENINGEN. Det finns en avläsning per energislag och
   // månad för hela föreningen — även när mätarna sitter i olika byggnader.
   // Därför beräknas Q/W, kWh/m² och normalårskorrigering en enda gång, här.
@@ -530,6 +536,7 @@ const normalize = (loaded) => {
     properties,
     billableOrders: numberedOrders,
     billableTimeEntries: loaded.billableTimeEntries || [],
+    billablePurchases: loaded.billablePurchases || [],
     invoiceBasis: loaded.invoiceBasis || [],
     nextOrderNumber: counter,
     utilityReports: reports,
@@ -1375,6 +1382,7 @@ function AuthenticatedApp({ session }) {
       issues: state.issues.filter((i) => !propIds.has(i.propertyId)),
       billableOrders: (state.billableOrders || []).filter((o) => !propIds.has(o.propertyId)),
       billableTimeEntries: (state.billableTimeEntries || []).filter((e) => !orderIds.has(e.orderId)),
+      billablePurchases: (state.billablePurchases || []).filter((p) => !orderIds.has(p.orderId)),
       invoiceBasis: (state.invoiceBasis || []).filter((b) => !propIds.has(b.propertyId)),
       utilityReports: (state.utilityReports || []).filter((r) => r.orgId !== id),
       rapportlogg: (state.rapportlogg || []).filter((r) => r.orgId !== id),
@@ -1689,6 +1697,10 @@ function OrganizationForm({ initial, onSubmit, onCancel }) {
   const [faRate, setFaRate] = useState(initial?.rates?.FA ?? "");
   const [tekRate, setTekRate] = useState(initial?.rates?.TEK ?? "");
   const [bilRate, setBilRate] = useState(initial?.rates?.BIL ?? "");
+  // Materialpåslag på inköp (%). Tomt fält tolkas som standard 10 %.
+  const [purchaseMarkup, setPurchaseMarkup] = useState(
+    initial && initial.purchaseMarkupPct != null ? String(initial.purchaseMarkupPct) : ""
+  );
   const [notes, setNotes] = useState(initial?.notes || "");
   const [vvAuto, setVvAuto] = useState(initial ? initial.vvAuto !== false : true);
   const [vvBastal, setVvBastal] = useState(initial?.vvBastal || "");
@@ -1743,6 +1755,7 @@ function OrganizationForm({ initial, onSubmit, onCancel }) {
       notes: notes.trim(),
       contacts: contacts.filter((c) => c.name.trim() || c.phone.trim() || c.email.trim()),
       rates: { FA: Number(faRate) || 0, TEK: Number(tekRate) || 0, BIL: Number(bilRate) || 0 },
+      purchaseMarkupPct: purchaseMarkup.trim() === "" ? 10 : Number(purchaseMarkup) || 0,
     });
   };
 
@@ -1832,6 +1845,11 @@ function OrganizationForm({ initial, onSubmit, onCancel }) {
             Bilersättning (kr/st)
             <input className="fk-input" style={S.input} inputMode="numeric" value={bilRate} onChange={(e) => setBilRate(e.target.value)} placeholder="0" />
             <span style={S.hint}>Per utryckning</span>
+          </label>
+          <label style={S.label}>
+            Materialpåslag inköp (%)
+            <input className="fk-input" style={S.input} inputMode="numeric" value={purchaseMarkup} onChange={(e) => setPurchaseMarkup(e.target.value)} placeholder="10" />
+            <span style={S.hint}>Pålägg när inköp faktureras. Tomt = 10 %.</span>
           </label>
         </div>
       </div>
@@ -2254,6 +2272,7 @@ function Oversikt({ state, scopedProps, selectedProperty, selectedOrg, setTab, o
               </div>
               <div style={{ ...S.rowSub, marginTop: 4 }}>
                 FA {selectedOrg.rates?.FA || 0} kr/h · TEK {selectedOrg.rates?.TEK || 0} kr/h · BIL {selectedOrg.rates?.BIL || 0} kr/st
+                {" · "}Materialpåslag {selectedOrg.purchaseMarkupPct ?? 10} %
               </div>
               <div style={{ ...S.rowSub, marginTop: 4 }}>
                 {(() => {
@@ -3990,6 +4009,7 @@ function IssueForm({ properties, onSubmit }) {
 
 function createBillingActions(state, setState, actor, notify) {
   const timeEntries = state.billableTimeEntries || [];
+  const purchases = state.billablePurchases || [];
   const invoiceBasis = state.invoiceBasis || [];
 
   const entriesFor = (orderId) => timeEntries.filter((e) => e.orderId === orderId);
@@ -3998,6 +4018,33 @@ function createBillingActions(state, setState, actor, notify) {
     entriesFor(orderId)
       .filter((e) => !e.invoicedInBasisId)
       .reduce((s, e) => s + Number(e.hours || 0), 0);
+
+  // Inköp fungerar spegelvänt mot tidrader: en egen lista, kopplad till order,
+  // som "förbrukas" när den kommer med i ett faktureringsunderlag.
+  const purchasesFor = (orderId) => purchases.filter((p) => p.orderId === orderId);
+  const unbilledPurchases = (orderId) => purchasesFor(orderId).filter((p) => !p.invoicedInBasisId);
+  const purchaseCost = (orderId) => purchasesFor(orderId).reduce((s, p) => s + Number(p.price || 0), 0);
+  const unbilledPurchaseCost = (orderId) =>
+    unbilledPurchases(orderId).reduce((s, p) => s + Number(p.price || 0), 0);
+
+  // Tidigare inskrivna leverantörer, unika och sorterade — matar rullistan så
+  // att man slipper skriva in samma leverantör två gånger.
+  const knownSuppliers = () => {
+    const seen = new Map();
+    purchases.forEach((p) => {
+      const name = (p.supplier || "").trim();
+      if (name && !seen.has(name.toLowerCase())) seen.set(name.toLowerCase(), name);
+    });
+    return Array.from(seen.values()).sort((a, b) => a.localeCompare(b, "sv"));
+  };
+
+  // Materialpåslaget hämtas från föreningen (Översikt). Standard 10 %.
+  const markupPctFor = (order) => {
+    const property = state.properties.find((p) => p.id === order.propertyId);
+    const org = (state.organizations || []).find((o) => o.id === property?.orgId);
+    const pct = Number(org?.purchaseMarkupPct);
+    return Number.isFinite(pct) ? pct : 10;
+  };
 
   // Timpriset kommer från föreningens avtal, om inte fastigheten har ett eget.
   const rateForOrder = (order) => {
@@ -4081,9 +4128,63 @@ function createBillingActions(state, setState, actor, notify) {
   const removeTimeEntry = (id) =>
     setState({ ...state, billableTimeEntries: timeEntries.filter((e) => e.id !== id) });
 
-  const createBasis = (order, adjustedHours, note) => {
+  const addPurchase = (order, payload) => {
+    const entry = {
+      id: uid(),
+      orderId: order.id,
+      supplier: (payload.supplier || "").trim(),
+      article: (payload.article || "").trim(),
+      price: Number(payload.price || 0),
+      note: (payload.note || "").trim(),
+      date: payload.date || todayISO(),
+      registeredBy: actor || "Okänd",
+      invoicedInBasisId: null,
+    };
+    setState({ ...state, billablePurchases: [...purchases, entry] });
+    notify("Inköp tillagt");
+  };
+
+  const removePurchase = (id) =>
+    setState({ ...state, billablePurchases: purchases.filter((p) => p.id !== id) });
+
+  // purchaseLines: [{ id, basePrice, markup }] — de inköp som tas med i underlaget.
+  // Priset kan ha justerats ned, och påslaget kan vara urbockat per rad. Default
+  // är att alla ej fakturerade inköp tas med, till fullt pris, med påslag på.
+  const createBasis = (order, adjustedHours, note, purchaseLines = null) => {
     const unbilled = entriesFor(order.id).filter((e) => !e.invoicedInBasisId);
     const includeBil = order.billCount > 0 && !order.billInvoicedInBasisId;
+    const pct = markupPctFor(order);
+    const availablePurchases = unbilledPurchases(order.id);
+
+    // Om anroparen inte skickar med rader tar vi som standard med alla ej
+    // fakturerade inköp, fullt pris, med påslag — så äldre anropsvägar funkar.
+    const lines =
+      purchaseLines ||
+      availablePurchases.map((p) => ({ id: p.id, basePrice: Number(p.price || 0), markup: true }));
+
+    const purchaseRecords = lines
+      .map((line) => {
+        const src = availablePurchases.find((p) => p.id === line.id);
+        if (!src) return null;
+        const basePrice = Number(line.basePrice || 0);
+        const markup = line.markup !== false;
+        const amount = markup ? Math.round(basePrice * (1 + pct / 100)) : basePrice;
+        return {
+          id: uid(),
+          purchaseId: src.id,
+          supplier: src.supplier || "",
+          article: src.article || "",
+          note: src.note || "",
+          basePrice,
+          markup,
+          markupPct: markup ? pct : 0,
+          amount,
+        };
+      })
+      .filter(Boolean);
+
+    const consumedPurchaseIds = new Set(purchaseRecords.map((r) => r.purchaseId));
+
     const basisId = uid();
     const basis = {
       id: basisId,
@@ -4094,17 +4195,23 @@ function createBillingActions(state, setState, actor, notify) {
       createdBy: actor || "Okänd",
       rate: rateForOrder(order),
       loggedHours: unbilled.reduce((s, e) => s + Number(e.hours || 0), 0),
-      adjustedHours: Number(adjustedHours),
+      adjustedHours: Number(adjustedHours || 0),
       note: note.trim(),
       entryIds: unbilled.map((e) => e.id),
       billCount: includeBil ? order.billCount : 0,
       billRate: includeBil ? billRateFor(order) : 0,
+      // Inköpsrader med sitt eget påslag, sparade permanent i underlaget.
+      purchases: purchaseRecords,
+      purchaseIds: purchaseRecords.map((r) => r.purchaseId),
     };
     setState({
       ...state,
       invoiceBasis: [...invoiceBasis, basis],
       billableTimeEntries: timeEntries.map((e) =>
         unbilled.find((u) => u.id === e.id) ? { ...e, invoicedInBasisId: basisId } : e
+      ),
+      billablePurchases: purchases.map((p) =>
+        consumedPurchaseIds.has(p.id) ? { ...p, invoicedInBasisId: basisId } : p
       ),
       billableOrders: state.billableOrders.map((o) =>
         o.id === order.id && includeBil ? { ...o, billInvoicedInBasisId: basisId } : o
@@ -4126,7 +4233,16 @@ function createBillingActions(state, setState, actor, notify) {
     entriesFor,
     loggedHours,
     unbilledHours,
-    rateFor,
+    purchasesFor,
+    unbilledPurchases,
+    purchaseCost,
+    unbilledPurchaseCost,
+    knownSuppliers,
+    markupPctFor,
+    // rateFor(order) — timpriset för den ordern. (Tidigare pekade den här på
+    // den råa modulfunktionen som förväntar sig andra argument, vilket gav 0
+    // kr/h i förhandsvisningarna. Nu används per-order-varianten.)
+    rateFor: rateForOrder,
     billRateFor,
     addOrder,
     cancelOrder,
@@ -4134,6 +4250,8 @@ function createBillingActions(state, setState, actor, notify) {
     updateBillCount,
     addTimeEntry,
     removeTimeEntry,
+    addPurchase,
+    removePurchase,
     createBasis,
     updateBasisHours,
   };
@@ -4149,6 +4267,7 @@ function Debitering({ state, scopedProps, billing, notify }) {
   const [filterCategory, setFilterCategory] = useState("alla");
   const [filterProperty, setFilterProperty] = useState("alla");
   const [nyckeltalOpen, setNyckeltalOpen] = useState(false);
+  const [filterOpen, setFilterOpen] = useState(false);
 
   const ids = new Set(scopedProps.map((p) => p.id));
   const showPropertyTag = scopedProps.length > 1;
@@ -4163,7 +4282,9 @@ function Debitering({ state, scopedProps, billing, notify }) {
     (o) => filterProperty === "alla" || o.propertyId === filterProperty
   );
   const filteredOrderIds = new Set(filteredOrders.map((o) => o.id));
-  const toInvoice = filteredOrders.filter((o) => billing.unbilledHours(o.id) > 0);
+  const toInvoice = filteredOrders.filter(
+    (o) => billing.unbilledHours(o.id) > 0 || billing.unbilledPurchaseCost(o.id) > 0
+  );
   const alreadyInvoiced = filteredOrders.filter((o) => hasBasis(o.id));
 
   const totalUnbilled = filteredOrders.reduce((s, o) => s + billing.unbilledHours(o.id), 0);
@@ -4171,6 +4292,9 @@ function Debitering({ state, scopedProps, billing, notify }) {
     (s, o) => s + billing.unbilledHours(o.id) * billing.rateFor(o),
     0
   );
+  // Inköp som ännu inte tagits med i något underlag (exkl. påslag) — en egen
+  // faktor i debiteringen vid sidan av timmarna.
+  const totalUnbilledPurchase = filteredOrders.reduce((s, o) => s + billing.unbilledPurchaseCost(o.id), 0);
 
   const filteredBasis = propertyBasis.filter((b) => filteredOrderIds.has(b.orderId));
   const totalLogged = filteredBasis.reduce((s, b) => s + Number(b.loggedHours || 0), 0);
@@ -4183,19 +4307,15 @@ function Debitering({ state, scopedProps, billing, notify }) {
   const invoicedAmountKr = filteredBasis.reduce((s, b) => s + Number(b.adjustedHours || 0) * Number(b.rate || 0), 0);
   const writtenOffAmountKr = Math.max(0, loggedAmountKr - invoicedAmountKr);
   const bilTotalKr = filteredBasis.reduce((s, b) => s + Number(b.billCount || 0) * Number(b.billRate || 0), 0);
+  // Fakturerade inköp inkl. påslag, summerat över underlagen i urvalet.
+  const purchaseTotalKr = filteredBasis.reduce((s, b) => s + basisPurchaseAmount(b), 0);
 
   const orderInvoicedAmount = (orderId) =>
-    invoiceBasis
-      .filter((b) => b.orderId === orderId)
-      .reduce(
-        (s, b) =>
-          s +
-          Number(b.adjustedHours || 0) * Number(b.rate || 0) +
-          Number(b.billCount || 0) * Number(b.billRate || 0),
-        0
-      );
+    invoiceBasis.filter((b) => b.orderId === orderId).reduce((s, b) => s + basisTotal(b), 0);
   const orderInvoicedHours = (orderId) =>
     invoiceBasis.filter((b) => b.orderId === orderId).reduce((s, b) => s + Number(b.adjustedHours || 0), 0);
+  const orderInvoicedPurchase = (orderId) =>
+    invoiceBasis.filter((b) => b.orderId === orderId).reduce((s, b) => s + basisPurchaseAmount(b), 0);
 
   const openOrder = openOrderId ? orders.find((o) => o.id === openOrderId) : null;
 
@@ -4219,9 +4339,13 @@ function Debitering({ state, scopedProps, billing, notify }) {
         order={openOrder}
         propertyName={propName(openOrder.propertyId)}
         entries={billing.entriesFor(openOrder.id).sort((a, b) => (a.date < b.date ? 1 : -1))}
+        purchases={billing.purchasesFor(openOrder.id).slice().sort((a, b) => (a.date < b.date ? 1 : -1))}
         basisList={invoiceBasis.filter((b) => b.orderId === openOrder.id).sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))}
         loggedHours={billing.loggedHours(openOrder.id)}
         unbilledHours={billing.unbilledHours(openOrder.id)}
+        unbilledPurchaseCost={billing.unbilledPurchaseCost(openOrder.id)}
+        knownSuppliers={billing.knownSuppliers()}
+        markupPct={billing.markupPctFor(openOrder)}
         rate={billing.rateFor(openOrder)}
         bilRate={billing.billRateFor(openOrder)}
         onUpdateBillCount={(count) => billing.updateBillCount(openOrder, count)}
@@ -4229,8 +4353,10 @@ function Debitering({ state, scopedProps, billing, notify }) {
         onBack={() => setOpenOrderId(null)}
         onAddEntry={(payload) => billing.addTimeEntry(openOrder, payload)}
         onRemoveEntry={billing.removeTimeEntry}
+        onAddPurchase={(payload) => billing.addPurchase(openOrder, payload)}
+        onRemovePurchase={billing.removePurchase}
         onReopen={(reason) => billing.setOrderStatus(openOrder, "Pågår", reason)}
-        onCreateBasis={(hours, note) => billing.createBasis(openOrder, hours, note)}
+        onCreateBasis={(hours, note, purchaseLines) => billing.createBasis(openOrder, hours, note, purchaseLines)}
         onUpdateBasisHours={billing.updateBasisHours}
         onPrintBasis={(basis) => setPrintingBasis({ basis, order: openOrder, entries: billing.entriesFor(openOrder.id).filter((e) => (basis.entryIds || []).includes(e.id)) })}
       />
@@ -4244,17 +4370,37 @@ function Debitering({ state, scopedProps, billing, notify }) {
       </div>
 
       {orders.length > 0 && (
-        <SortFilterBar
-          sortBy={sortBy}
-          setSortBy={setSortBy}
-          filterType={filterType}
-          setFilterType={setFilterType}
-          filterCategory={filterCategory}
-          setFilterCategory={setFilterCategory}
-          filterProperty={filterProperty}
-          setFilterProperty={setFilterProperty}
-          properties={scopedProps}
-        />
+        <div style={S.filterPanel}>
+          <button
+            type="button"
+            className="fk-btn"
+            onClick={() => setFilterOpen((v) => !v)}
+            style={S.filterToggle}
+          >
+            <span style={{ ...S.issueChevron, transform: filterOpen ? "rotate(90deg)" : "none" }}>▸</span>
+            Sortering &amp; filter
+            {filterActive && (
+              <span style={S.filterToggleActive}>· aktivt filter</span>
+            )}
+          </button>
+
+          {filterOpen && (
+            <div style={{ marginTop: 12 }}>
+              <SortFilterBar
+                sortBy={sortBy}
+                setSortBy={setSortBy}
+                filterType={filterType}
+                setFilterType={setFilterType}
+                filterCategory={filterCategory}
+                setFilterCategory={setFilterCategory}
+                filterProperty={filterProperty}
+                setFilterProperty={setFilterProperty}
+                properties={scopedProps}
+                bare
+              />
+            </div>
+          )}
+        </div>
       )}
 
       <div style={S.panel}>
@@ -4292,6 +4438,10 @@ function Debitering({ state, scopedProps, billing, notify }) {
               <div style={S.statCard}>
                 <div style={{ ...S.statValue, color: "#1C2321" }}>{totalUnbilledAmount.toLocaleString("sv-SE")} kr</div>
                 <div style={S.statLabel}>Ofakturerat belopp (ca)</div>
+              </div>
+              <div style={S.statCard}>
+                <div style={{ ...S.statValue, fontSize: 22, color: "#3A413C" }}>{totalUnbilledPurchase.toLocaleString("sv-SE")} kr</div>
+                <div style={S.statLabel}>Ofakturerade inköp (exkl. påslag)</div>
               </div>
               <div style={S.statCard}>
                 <div style={S.statValue}>{filteredOrders.length}</div>
@@ -4341,6 +4491,10 @@ function Debitering({ state, scopedProps, billing, notify }) {
                 <div style={{ ...S.kpiValue, color: "#1C2321" }}>{bilTotalKr.toLocaleString("sv-SE")} kr</div>
                 <div style={S.kpiLabel}>Totalt för Bil</div>
               </div>
+              <div style={S.kpiBlock}>
+                <div style={{ ...S.kpiValue, color: "#2B6E5E" }}>{purchaseTotalKr.toLocaleString("sv-SE")} kr</div>
+                <div style={S.kpiLabel}>Fakturerade inköp (inkl. påslag)</div>
+              </div>
             </div>
 
             {totalLogged === 0 && (
@@ -4353,15 +4507,15 @@ function Debitering({ state, scopedProps, billing, notify }) {
       </div>
 
 
-      <h3 style={{ ...S.panelTitle, marginTop: 20 }}>Klarmarkerade ärenden och tidrader att fakturera</h3>
+      <h3 style={{ ...S.panelTitle, marginTop: 20 }}>Klarmarkerade ärenden att fakturera</h3>
       {toInvoice.length === 0 ? (
-        <EmptyNote text={orders.length > 0 ? "Inga ärenden matchar filtret." : "Inga klarmarkerade ärenden eller tidrader väntar på fakturering just nu."} />
+        <EmptyNote text={orders.length > 0 ? "Inga ärenden matchar filtret." : "Inga klarmarkerade ärenden, tidrader eller inköp väntar på fakturering just nu."} />
       ) : (
         <div style={S.checklistStack}>
           {sortOrders(toInvoice, sortBy, (o) => ({
             date: o.completedAt,
             hours: billing.loggedHours(o.id),
-            amount: billing.unbilledHours(o.id) * billing.rateFor(o),
+            amount: billing.unbilledHours(o.id) * billing.rateFor(o) + billing.unbilledPurchaseCost(o.id),
           })).map((o) => (
             <DebiteringOrderCard
               key={o.id}
@@ -4403,7 +4557,9 @@ function Debitering({ state, scopedProps, billing, notify }) {
                   <span style={S.rowSub}>
                     {orderInvoicedHours(o.id)} h fakturerat · {orderInvoicedAmount(o.id).toLocaleString("sv-SE")} kr
                     {o.billCount > 0 && ` · Bil ${o.billCount} st`}
+                    {orderInvoicedPurchase(o.id) > 0 && ` · varav inköp ${orderInvoicedPurchase(o.id).toLocaleString("sv-SE")} kr`}
                     {billing.unbilledHours(o.id) > 0 && ` · ${billing.unbilledHours(o.id)} h kvar att fakturera`}
+                    {billing.unbilledPurchaseCost(o.id) > 0 && ` · inköp kvar att fakturera`}
                   </span>
                   <button style={S.stampBtn} className="fk-btn" onClick={() => setOpenOrderId(o.id)}>
                     Visa underlag
@@ -4420,6 +4576,7 @@ function Debitering({ state, scopedProps, billing, notify }) {
 function DebiteringOrderCard({ order: o, billing, propertyName, onOpen }) {
   const logged = billing.loggedHours(o.id);
   const unbilled = billing.unbilledHours(o.id);
+  const unbilledPurchase = billing.unbilledPurchaseCost(o.id);
   return (
     <div style={S.checklistCardPending}>
       <div style={S.checklistHead}>
@@ -4439,6 +4596,7 @@ function DebiteringOrderCard({ order: o, billing, propertyName, onOpen }) {
         <span style={S.rowSub}>
           {logged} h loggat · {unbilled} h att fakturera{o.priceCategory ? ` · ${o.priceCategory} (${billing.rateFor(o)} kr/h)` : ""}
           {o.billCount > 0 && ` · Bil ${o.billCount} st`}
+          {unbilledPurchase > 0 && ` · Inköp ${unbilledPurchase.toLocaleString("sv-SE")} kr att fakturera`}
         </span>
         <button style={S.stampBtn} className="fk-btn" onClick={onOpen}>
           Hantera fakturering
@@ -4485,6 +4643,8 @@ function ArendeQueue({ type, title, newLabel, titleFieldLabel, titlePlaceholder,
   const [sortBy, setSortBy] = useState("datum-senaste");
   const [filterCategory, setFilterCategory] = useState("alla");
   const [filterProperty, setFilterProperty] = useState("alla");
+  const [filterOpen, setFilterOpen] = useState(false);
+  const filterActive = filterCategory !== "alla" || filterProperty !== "alla";
 
   const ids = new Set(scopedProps.map((p) => p.id));
   const showPropertyTag = scopedProps.length > 1;
@@ -4530,15 +4690,21 @@ function ArendeQueue({ type, title, newLabel, titleFieldLabel, titlePlaceholder,
         order={openOrder}
         propertyName={propName(openOrder.propertyId)}
         entries={billing.entriesFor(openOrder.id).sort((a, b) => (a.date < b.date ? 1 : -1))}
+        purchases={billing.purchasesFor(openOrder.id).slice().sort((a, b) => (a.date < b.date ? 1 : -1))}
         basisList={invoiceBasis.filter((b) => b.orderId === openOrder.id).sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))}
         loggedHours={billing.loggedHours(openOrder.id)}
         unbilledHours={billing.unbilledHours(openOrder.id)}
+        unbilledPurchaseCost={billing.unbilledPurchaseCost(openOrder.id)}
+        knownSuppliers={billing.knownSuppliers()}
+        markupPct={billing.markupPctFor(openOrder)}
         rate={billing.rateFor(openOrder)}
         bilRate={billing.billRateFor(openOrder)}
         onUpdateBillCount={canStillEdit ? (count) => billing.updateBillCount(openOrder, count) : undefined}
         onBack={() => setOpenOrderId(null)}
         onAddEntry={(payload) => billing.addTimeEntry(openOrder, payload)}
         onRemoveEntry={billing.removeTimeEntry}
+        onAddPurchase={(payload) => billing.addPurchase(openOrder, payload)}
+        onRemovePurchase={billing.removePurchase}
         onComplete={
           canStillEdit
             ? () => {
@@ -4560,7 +4726,7 @@ function ArendeQueue({ type, title, newLabel, titleFieldLabel, titlePlaceholder,
             ? (reason) => billing.setOrderStatus(openOrder, "Pågår", reason)
             : undefined
         }
-        onCreateBasis={(hours, note) => billing.createBasis(openOrder, hours, note)}
+        onCreateBasis={(hours, note, purchaseLines) => billing.createBasis(openOrder, hours, note, purchaseLines)}
         onUpdateBasisHours={billing.updateBasisHours}
         onPrintBasis={(basis) => setPrintingBasis({ basis, order: openOrder, entries: billing.entriesFor(openOrder.id).filter((e) => (basis.entryIds || []).includes(e.id)) })}
       />
@@ -4668,15 +4834,35 @@ function ArendeQueue({ type, title, newLabel, titleFieldLabel, titlePlaceholder,
       )}
 
       {allOrdersForType.length > 0 && (
-        <SortFilterBar
-          sortBy={sortBy}
-          setSortBy={setSortBy}
-          filterCategory={filterCategory}
-          setFilterCategory={setFilterCategory}
-          filterProperty={filterProperty}
-          setFilterProperty={setFilterProperty}
-          properties={scopedProps}
-        />
+        <div style={S.filterPanel}>
+          <button
+            type="button"
+            className="fk-btn"
+            onClick={() => setFilterOpen((v) => !v)}
+            style={S.filterToggle}
+          >
+            <span style={{ ...S.issueChevron, transform: filterOpen ? "rotate(90deg)" : "none" }}>▸</span>
+            Sortering &amp; filter
+            {filterActive && (
+              <span style={S.filterToggleActive}>· aktivt filter</span>
+            )}
+          </button>
+
+          {filterOpen && (
+            <div style={{ marginTop: 12 }}>
+              <SortFilterBar
+                sortBy={sortBy}
+                setSortBy={setSortBy}
+                filterCategory={filterCategory}
+                setFilterCategory={setFilterCategory}
+                filterProperty={filterProperty}
+                setFilterProperty={setFilterProperty}
+                properties={scopedProps}
+                bare
+              />
+            </div>
+          )}
+        </div>
       )}
 
       <h3 style={S.panelTitle}>{title} att hantera</h3>
@@ -4876,15 +5062,21 @@ function OrderDetail({
   order,
   propertyName,
   entries,
+  purchases = [],
   basisList,
   loggedHours,
   unbilledHours,
+  unbilledPurchaseCost = 0,
+  knownSuppliers = [],
+  markupPct = 10,
   rate,
   bilRate,
   allowInvoicing,
   onBack,
   onAddEntry,
   onRemoveEntry,
+  onAddPurchase,
+  onRemovePurchase,
   onComplete,
   onReopen,
   onCancel,
@@ -4894,6 +5086,10 @@ function OrderDetail({
   onUpdateBillCount,
 }) {
   const [showEntryForm, setShowEntryForm] = useState(false);
+  const [showPurchaseForm, setShowPurchaseForm] = useState(false);
+  // Inköpsavsnittet är dolt tills man bockar i det — men fälls ut automatiskt
+  // om ärendet redan har inköp registrerade.
+  const [showPurchaseSection, setShowPurchaseSection] = useState(purchases.length > 0);
   const [showBasisForm, setShowBasisForm] = useState(false);
   const [confirmingReopen, setConfirmingReopen] = useState(false);
   const [reopenReason, setReopenReason] = useState("");
@@ -4905,6 +5101,9 @@ function OrderDetail({
   // aldrig när det är klarmarkerat (oavsett varifrån man tittar på det).
   // Vill man ändra tid på ett klarmarkerat ärende måste man återöppna det först.
   const canEditTime = !readOnly && order.status !== "Klar";
+  // Inköp följer samma regel som tidrader.
+  const canEditPurchases = canEditTime;
+  const unbilledPurchases = purchases.filter((p) => !p.invoicedInBasisId);
   const hasExistingBasis = basisList.length > 0;
 
   const confirmCancel = () => {
@@ -5024,6 +5223,14 @@ function OrderDetail({
           <div style={{ ...S.statValue, color: "#3A413C" }}>{unbilledHours}</div>
           <div style={S.statLabel}>Att fakturera (h)</div>
         </div>
+        {purchases.length > 0 && (
+          <div style={S.statCard}>
+            <div style={{ ...S.statValue, fontSize: 20, color: "#3A413C" }}>
+              {Number(unbilledPurchaseCost).toLocaleString("sv-SE")} kr
+            </div>
+            <div style={S.statLabel}>Inköp att fakturera (exkl. påslag)</div>
+          </div>
+        )}
       </div>
 
       {onUpdateBillCount && (
@@ -5114,10 +5321,84 @@ function OrderDetail({
         </div>
       )}
 
+      {/* ------- Inköp (separat del, egen till/från-brytare) ------- */}
+      {/* Till/från-brytaren visas bara när man faktiskt kan lägga till inköp.
+          Finns det redan inköp visas avsnittet ändå (även på klarmarkerade
+          ärenden), precis som tidraderna. */}
+      {onAddPurchase && canEditPurchases && (
+        <div style={{ ...S.panel, marginTop: 20 }}>
+          <label style={{ ...S.checkRow, fontWeight: 600 }}>
+            <input
+              type="checkbox"
+              style={S.checkbox}
+              checked={showPurchaseSection}
+              onChange={(e) => setShowPurchaseSection(e.target.checked)}
+              disabled={purchases.length > 0}
+            />
+            Registrera inköp på det här ärendet
+          </label>
+          <div style={{ ...S.rowSub, marginTop: 4 }}>
+            Inköp hålls separat från tiden. De faktureras med föreningens materialpåslag
+            ({markupPct} %), som går att bocka ur per rad när underlaget skapas.
+          </div>
+        </div>
+      )}
+
+      {onAddPurchase && (showPurchaseSection || purchases.length > 0) && (
+        <>
+          <div style={S.sectionHead}>
+            <h3 style={S.panelTitle}>Inköp</h3>
+            {canEditPurchases && (
+              <button
+                style={showPurchaseForm ? S.secondaryBtnSmall : S.primaryBtnSmall}
+                className="fk-btn"
+                onClick={() => setShowPurchaseForm((s) => !s)}
+              >
+                {showPurchaseForm ? "Avbryt" : "+ Lägg till inköp"}
+              </button>
+            )}
+          </div>
+
+          {showPurchaseForm && canEditPurchases && (
+            <PurchaseEntryForm
+              knownSuppliers={knownSuppliers}
+              markupPct={markupPct}
+              onSubmit={(payload) => {
+                onAddPurchase(payload);
+                setShowPurchaseForm(false);
+              }}
+            />
+          )}
+
+          {purchases.length === 0 ? (
+            <EmptyNote text="Inga inköp registrerade ännu på det här ärendet." />
+          ) : (
+            <div style={S.checklistStack}>
+              {purchases.map((p) => (
+                <div key={p.id} style={S.entryRow}>
+                  <div>
+                    <div style={S.rowTitle}>
+                      {p.article || "Inköp"} · {Number(p.price || 0).toLocaleString("sv-SE")} kr
+                      {p.invoicedInBasisId && <span style={S.invoicedTag}>fakturerad</span>}
+                    </div>
+                    {p.supplier && <div style={S.rowSub}>Leverantör: {p.supplier}</div>}
+                    {p.note && <div style={S.rowSub}>{p.note}</div>}
+                    <div style={S.rowSub}>{fmtDate(p.date)} · {p.registeredBy}</div>
+                  </div>
+                  {canEditPurchases && !p.invoicedInBasisId && (
+                    <button style={S.miniDelete} onClick={() => onRemovePurchase(p.id)} aria-label="Ta bort inköp">×</button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+
       {allowInvoicing && (
         <div style={{ ...S.sectionHead, marginTop: 24 }}>
           <h3 style={S.panelTitle}>Faktureringsunderlag</h3>
-          {(unbilledHours > 0 || (order.billCount > 0 && !bilLocked)) && (
+          {(unbilledHours > 0 || unbilledPurchases.length > 0 || (order.billCount > 0 && !bilLocked)) && (
             <button style={showBasisForm ? S.secondaryBtnSmall : S.primaryBtnSmall} className="fk-btn" onClick={() => setShowBasisForm((s) => !s)}>
               {showBasisForm ? "Avbryt" : "Skapa underlag"}
             </button>
@@ -5131,8 +5412,10 @@ function OrderDetail({
           includesBil={order.billCount > 0 && !bilLocked}
           bilCount={order.billCount}
           bilRate={bilRate}
-          onSubmit={(hours, note) => {
-            onCreateBasis(hours, note);
+          purchases={unbilledPurchases}
+          markupPct={markupPct}
+          onSubmit={(hours, note, purchaseLines) => {
+            onCreateBasis(hours, note, purchaseLines);
             setShowBasisForm(false);
           }}
         />
@@ -5158,6 +5441,8 @@ function OrderDetail({
                   <div style={S.rowSub}>
                     Loggat {b.loggedHours} h · av {b.createdBy}
                     {b.billCount > 0 && ` · Bil ${b.billCount} st à ${b.billRate} kr`}
+                    {(b.purchases || []).length > 0 &&
+                      ` · ${b.purchases.length} inköp (${basisPurchaseAmount(b).toLocaleString("sv-SE")} kr)`}
                   </div>
                   {b.note && <div style={{ ...S.rowSub, marginTop: 4 }}>{b.note}</div>}
                 </div>
@@ -5176,14 +5461,15 @@ function OrderDetail({
                       onChange={(e) => onUpdateBasisHours(b, e.target.value)}
                     />
                     <span style={S.rowSub}>
-                      × {b.rate} kr/h = {(b.adjustedHours * b.rate).toLocaleString("sv-SE")} kr
-                      {b.billCount > 0 && ` + ${(b.billCount * b.billRate).toLocaleString("sv-SE")} kr bil`}
+                      × {b.rate} kr/h · underlag totalt {basisTotal(b).toLocaleString("sv-SE")} kr
                     </span>
                   </label>
                 ) : (
                   <span style={S.rowSub}>
-                    {b.adjustedHours} h × {b.rate} kr/h = {(b.adjustedHours * b.rate).toLocaleString("sv-SE")} kr
+                    {b.adjustedHours} h × {b.rate} kr/h
                     {b.billCount > 0 && ` + ${(b.billCount * b.billRate).toLocaleString("sv-SE")} kr bil`}
+                    {(b.purchases || []).length > 0 && ` + ${basisPurchaseAmount(b).toLocaleString("sv-SE")} kr inköp`}
+                    {" · totalt "}{basisTotal(b).toLocaleString("sv-SE")} kr
                   </span>
                 )}
                 <button style={S.stampBtn} className="fk-btn" onClick={() => onPrintBasis(b)}>
@@ -5283,14 +5569,156 @@ function TimeEntryForm({ onSubmit }) {
   );
 }
 
-function BasisForm({ suggestedHours, includesBil, bilCount, bilRate, onSubmit }) {
-  const [hours, setHours] = useState(suggestedHours);
+function PurchaseEntryForm({ knownSuppliers = [], markupPct = 10, onSubmit }) {
+  const NEW = "__new__";
+  const [date, setDate] = useState(todayISO());
+  // Leverantör väljs i rullista av tidigare inskrivna — eller "Ny leverantör".
+  const [supplierMode, setSupplierMode] = useState(knownSuppliers.length ? "existing" : "new");
+  const [supplierSelect, setSupplierSelect] = useState(knownSuppliers[0] || "");
+  const [supplierNew, setSupplierNew] = useState("");
+  const [article, setArticle] = useState("");
+  const [price, setPrice] = useState("");
   const [note, setNote] = useState("");
+
+  const supplier = supplierMode === "new" ? supplierNew.trim() : supplierSelect;
+  const priceNum = Number(price) || 0;
+  const withMarkup = Math.round(priceNum * (1 + Number(markupPct || 0) / 100));
 
   const submit = (e) => {
     e.preventDefault();
-    if (!hours && hours !== 0) return;
-    onSubmit(hours, note);
+    if (!article.trim() || !price) return;
+    onSubmit({ date, supplier, article: article.trim(), price: priceNum, note: note.trim() });
+  };
+
+  return (
+    <form onSubmit={submit} style={S.formPanel}>
+      <div style={S.formRow} className="fk-form-row">
+        <label style={S.label}>
+          Datum
+          <input className="fk-input" style={S.input} type="date" value={date} onChange={(e) => setDate(e.target.value)} required />
+        </label>
+        <label style={S.label}>
+          Leverantör
+          {knownSuppliers.length > 0 ? (
+            <select
+              className="fk-input"
+              style={S.input}
+              value={supplierMode === "new" ? NEW : supplierSelect}
+              onChange={(e) => {
+                if (e.target.value === NEW) {
+                  setSupplierMode("new");
+                } else {
+                  setSupplierMode("existing");
+                  setSupplierSelect(e.target.value);
+                }
+              }}
+            >
+              {knownSuppliers.map((s) => (
+                <option key={s} value={s}>{s}</option>
+              ))}
+              <option value={NEW}>➕ Ny leverantör…</option>
+            </select>
+          ) : null}
+          {(supplierMode === "new" || knownSuppliers.length === 0) && (
+            <input
+              className="fk-input"
+              style={{ ...S.input, marginTop: knownSuppliers.length > 0 ? 8 : 0 }}
+              value={supplierNew}
+              onChange={(e) => setSupplierNew(e.target.value)}
+              placeholder="t.ex. Ahlsell, Bauhaus, XL-Bygg"
+            />
+          )}
+          <span style={S.hint}>Tidigare leverantörer finns i listan — annars välj "Ny leverantör".</span>
+        </label>
+      </div>
+
+      <div style={S.formRow} className="fk-form-row">
+        <label style={S.label}>
+          Artikel / beskrivning
+          <input
+            className="fk-input"
+            style={S.input}
+            value={article}
+            onChange={(e) => setArticle(e.target.value)}
+            placeholder="t.ex. Gräsklipparblad, oljefilter"
+            required
+          />
+        </label>
+        <label style={S.label}>
+          Inköpspris (kr)
+          <input
+            className="fk-input"
+            style={S.input}
+            type="number"
+            step="1"
+            min="0"
+            inputMode="numeric"
+            value={price}
+            onChange={(e) => setPrice(e.target.value)}
+            placeholder="0"
+            required
+          />
+          <span style={S.hint}>
+            {priceNum > 0
+              ? `Faktureras ${withMarkup.toLocaleString("sv-SE")} kr med ${markupPct} % påslag (går att ändra i underlaget).`
+              : `Föreningens materialpåslag är ${markupPct} %.`}
+          </span>
+        </label>
+      </div>
+
+      <label style={S.label}>
+        Kommentar (valfritt)
+        <textarea
+          className="fk-input"
+          style={{ ...S.input, height: 90, resize: "vertical" }}
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+          placeholder='t.ex. "Inköp för att omhänderta gräsklippning"'
+        />
+      </label>
+      <button type="submit" style={S.primaryBtnSmall} className="fk-btn">Spara inköp</button>
+    </form>
+  );
+}
+
+function BasisForm({ suggestedHours, includesBil, bilCount, bilRate, purchases = [], markupPct = 10, onSubmit }) {
+  const [hours, setHours] = useState(suggestedHours);
+  const [note, setNote] = useState("");
+  // En rad per ej fakturerat inköp. Default: ta med, fullt pris, påslag på.
+  const [purchaseRows, setPurchaseRows] = useState(() =>
+    purchases.map((p) => ({
+      id: p.id,
+      include: true,
+      basePrice: String(p.price ?? 0),
+      markup: true,
+      supplier: p.supplier || "",
+      article: p.article || "",
+      note: p.note || "",
+    }))
+  );
+
+  const updateRow = (id, patch) =>
+    setPurchaseRows((rows) => rows.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+
+  const lineAmount = (r) => {
+    const base = Number(r.basePrice) || 0;
+    return r.markup ? Math.round(base * (1 + Number(markupPct || 0) / 100)) : base;
+  };
+
+  const includedRows = purchaseRows.filter((r) => r.include);
+  const purchaseSum = includedRows.reduce((s, r) => s + lineAmount(r), 0);
+  const hoursNum = Number(hours) || 0;
+
+  const submit = (e) => {
+    e.preventDefault();
+    const purchaseLines = includedRows.map((r) => ({
+      id: r.id,
+      basePrice: Number(r.basePrice) || 0,
+      markup: r.markup,
+    }));
+    // Måste finnas något att fakturera: tid, bil eller minst ett inköp.
+    if (hoursNum <= 0 && !includesBil && purchaseLines.length === 0) return;
+    onSubmit(hoursNum, note, purchaseLines);
   };
 
   return (
@@ -5316,7 +5744,6 @@ function BasisForm({ suggestedHours, includesBil, bilCount, bilRate, onSubmit })
             min="0"
             value={hours}
             onChange={(e) => setHours(e.target.value)}
-            required
           />
         </label>
         <label style={S.label}>
@@ -5324,17 +5751,98 @@ function BasisForm({ suggestedHours, includesBil, bilCount, bilRate, onSubmit })
           <input className="fk-input" style={S.input} value={note} onChange={(e) => setNote(e.target.value)} placeholder="t.ex. avrundat till hel timme" />
         </label>
       </div>
+
+      {purchaseRows.length > 0 && (
+        <div style={{ border: "1px solid #C9C4B7", borderRadius: 8, padding: "12px 14px" }}>
+          <div style={{ ...S.label, marginBottom: 8 }}>Inköp i underlaget</div>
+          <div style={{ ...S.rowSub, marginBottom: 10 }}>
+            Alla inköp tas med som standard och räknas upp med föreningens materialpåslag ({markupPct} %).
+            Bocka ur "Ta med" för att lämna kvar ett inköp till senare, justera priset, eller bocka ur
+            "Räkna upp" för att fakturera ett inköp utan påslag.
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {purchaseRows.map((r) => (
+              <div
+                key={r.id}
+                style={{
+                  border: "1px solid #E6E1D6",
+                  borderRadius: 8,
+                  padding: "10px 12px",
+                  background: r.include ? "#FBFAF7" : "#F3F1EC",
+                  opacity: r.include ? 1 : 0.65,
+                }}
+              >
+                <label style={{ ...S.checkRow, fontWeight: 600, marginBottom: 6 }}>
+                  <input
+                    type="checkbox"
+                    style={S.checkbox}
+                    checked={r.include}
+                    onChange={(e) => updateRow(r.id, { include: e.target.checked })}
+                  />
+                  {r.article || "Inköp"}{r.supplier ? ` · ${r.supplier}` : ""}
+                </label>
+                {r.note && <div style={{ ...S.rowSub, marginBottom: 6 }}>{r.note}</div>}
+                {r.include && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                    <label style={{ ...S.adjustRow }}>
+                      Pris (kr)
+                      <input
+                        className="fk-input"
+                        style={S.adjustInput}
+                        type="number"
+                        step="1"
+                        min="0"
+                        value={r.basePrice}
+                        onChange={(e) => updateRow(r.id, { basePrice: e.target.value })}
+                      />
+                    </label>
+                    <label style={S.checkRow}>
+                      <input
+                        type="checkbox"
+                        style={S.checkbox}
+                        checked={r.markup}
+                        onChange={(e) => updateRow(r.id, { markup: e.target.checked })}
+                      />
+                      Räkna upp ({markupPct} %)
+                    </label>
+                    <span style={{ ...S.rowSub, fontWeight: 600, color: "#1C2321" }}>
+                      = {lineAmount(r).toLocaleString("sv-SE")} kr
+                      {!r.markup && <span style={{ color: "#B07A16", fontWeight: 500 }}> · utan påslag</span>}
+                    </span>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+          {includedRows.length > 0 && (
+            <div style={{ ...S.rowSub, marginTop: 10, fontWeight: 600, color: "#1C2321" }}>
+              Inköp totalt i underlaget: {purchaseSum.toLocaleString("sv-SE")} kr
+            </div>
+          )}
+        </div>
+      )}
+
       <button type="submit" style={S.addBtn} className="fk-btn">Spara faktureringsunderlag</button>
     </form>
   );
 }
 
+/* ------------------------------ beloppsberäkning (underlag) ------------------------------ */
+
+// Delbeloppen i ett faktureringsunderlag räknas på ett enda ställe så att
+// skärmvy, PDF och nyckeltal alltid är överens.
+const basisHoursAmount = (b) => Number(b.adjustedHours || 0) * Number(b.rate || 0);
+const basisBilAmount = (b) => Number(b.billCount || 0) * Number(b.billRate || 0);
+const basisPurchaseAmount = (b) => (b.purchases || []).reduce((s, p) => s + Number(p.amount || 0), 0);
+const basisTotal = (b) => basisHoursAmount(b) + basisBilAmount(b) + basisPurchaseAmount(b);
+
 /* ------------------------------ pdf-generering (faktureringsunderlag) ------------------------------ */
 
 function buildBasisPdf(basis, order, propertyName, propertyAddress, entries) {
-  const hoursAmount = Number(basis.adjustedHours) * Number(basis.rate);
-  const bilAmount = Number(basis.billCount || 0) * Number(basis.billRate || 0);
-  const amount = hoursAmount + bilAmount;
+  const hoursAmount = basisHoursAmount(basis);
+  const bilAmount = basisBilAmount(basis);
+  const purchaseAmount = basisPurchaseAmount(basis);
+  const amount = hoursAmount + bilAmount + purchaseAmount;
   const basisEntries = (entries || []).slice().sort((a, b) => (a.date < b.date ? -1 : 1));
 
   const doc = new jsPDF({ unit: "pt", format: "a4" });
@@ -5393,16 +5901,29 @@ function buildBasisPdf(basis, order, propertyName, propertyAddress, entries) {
 
   y += 12;
 
-  const rows = [
-    [
+  const rows = [];
+  if (Number(basis.adjustedHours || 0) > 0 || Number(basis.loggedHours || 0) > 0) {
+    rows.push([
       `${order.title}${basis.note ? ` — ${basis.note}` : ""}`,
       `${basis.adjustedHours} h`,
       `${basis.rate} kr/h`,
       `${hoursAmount.toLocaleString("sv-SE")} kr`,
-    ],
-  ];
+    ]);
+  }
   if (basis.billCount > 0) {
     rows.push(["Bil", `${basis.billCount} st`, `${basis.billRate} kr/st`, `${bilAmount.toLocaleString("sv-SE")} kr`]);
+  }
+  (basis.purchases || []).forEach((p) => {
+    const label = [p.article || "Inköp", p.supplier ? `(${p.supplier})` : "", p.note ? `— ${p.note}` : ""]
+      .filter(Boolean)
+      .join(" ");
+    const priceCol = p.markup
+      ? `${p.basePrice.toLocaleString("sv-SE")} kr +${p.markupPct} %`
+      : `${p.basePrice.toLocaleString("sv-SE")} kr`;
+    rows.push([label, "1 st", priceCol, `${Number(p.amount || 0).toLocaleString("sv-SE")} kr`]);
+  });
+  if (rows.length === 0) {
+    rows.push([order.title, "—", "—", "0 kr"]);
   }
 
   autoTable(doc, {
@@ -5459,9 +5980,11 @@ function basisPdfFilename(basis, order) {
 
 function PrintableBasis({ basis, order, propertyName, propertyAddress, entries, onClose, notify }) {
   const [sending, setSending] = useState(false);
-  const hoursAmount = Number(basis.adjustedHours) * Number(basis.rate);
-  const bilAmount = Number(basis.billCount || 0) * Number(basis.billRate || 0);
-  const amount = hoursAmount + bilAmount;
+  const hoursAmount = basisHoursAmount(basis);
+  const bilAmount = basisBilAmount(basis);
+  const purchaseAmount = basisPurchaseAmount(basis);
+  const amount = hoursAmount + bilAmount + purchaseAmount;
+  const showHoursRow = Number(basis.adjustedHours || 0) > 0 || Number(basis.loggedHours || 0) > 0;
 
   const downloadPdf = () => {
     const doc = buildBasisPdf(basis, order, propertyName, propertyAddress, entries);
@@ -5545,12 +6068,14 @@ function PrintableBasis({ basis, order, propertyName, propertyAddress, entries, 
             </tr>
           </thead>
           <tbody>
-            <tr>
-              <td style={S.invoiceTd}>{order.title}{basis.note ? ` — ${basis.note}` : ""}</td>
-              <td style={S.invoiceTd}>{basis.adjustedHours} h</td>
-              <td style={S.invoiceTd}>{basis.rate} kr/h</td>
-              <td style={S.invoiceTd}>{hoursAmount.toLocaleString("sv-SE")} kr</td>
-            </tr>
+            {showHoursRow && (
+              <tr>
+                <td style={S.invoiceTd}>{order.title}{basis.note ? ` — ${basis.note}` : ""}</td>
+                <td style={S.invoiceTd}>{basis.adjustedHours} h</td>
+                <td style={S.invoiceTd}>{basis.rate} kr/h</td>
+                <td style={S.invoiceTd}>{hoursAmount.toLocaleString("sv-SE")} kr</td>
+              </tr>
+            )}
             {basis.billCount > 0 && (
               <tr>
                 <td style={S.invoiceTd}>Bil</td>
@@ -5559,6 +6084,21 @@ function PrintableBasis({ basis, order, propertyName, propertyAddress, entries, 
                 <td style={S.invoiceTd}>{bilAmount.toLocaleString("sv-SE")} kr</td>
               </tr>
             )}
+            {(basis.purchases || []).map((p) => (
+              <tr key={p.id}>
+                <td style={S.invoiceTd}>
+                  {p.article || "Inköp"}
+                  {p.supplier ? ` · ${p.supplier}` : ""}
+                  {p.note ? ` — ${p.note}` : ""}
+                </td>
+                <td style={S.invoiceTd}>1 st</td>
+                <td style={S.invoiceTd}>
+                  {p.basePrice.toLocaleString("sv-SE")} kr
+                  {p.markup ? ` + ${p.markupPct} %` : " (utan påslag)"}
+                </td>
+                <td style={S.invoiceTd}>{Number(p.amount || 0).toLocaleString("sv-SE")} kr</td>
+              </tr>
+            ))}
           </tbody>
         </table>
 
@@ -5617,6 +6157,7 @@ const BACKUP_LABELS = {
   issues: "Ärenden",
   billableOrders: "Ärenden (debitering)",
   billableTimeEntries: "Tidrader",
+  billablePurchases: "Inköp",
   invoiceBasis: "Faktureringsunderlag",
   utilityReports: "Driftrapporter",
   klimatdata: "Graddagar (klimatdata)",
@@ -5712,6 +6253,7 @@ function Backup({ state, setState, notify, lastSavedAt }) {
       issues: d.issues || [],
       billableOrders: d.billableOrders || [],
       billableTimeEntries: d.billableTimeEntries || [],
+      billablePurchases: d.billablePurchases || [],
       invoiceBasis: d.invoiceBasis || [],
       utilityReports: d.utilityReports || [],
       klimatdata: d.klimatdata || {},
@@ -8048,6 +8590,24 @@ const S = {
   twoCol: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 },
   panel: { background: "#FFFFFF", border: "1px solid #C9C4B7", borderRadius: 8, padding: 16, marginBottom: 14 },
   panelTitle: { fontFamily: "'Oswald', sans-serif", fontSize: 15, fontWeight: 600, margin: "0 0 10px" },
+  filterPanel: { background: "#FBFAF7", border: "1px solid #DAD5C8", borderRadius: 8, padding: "9px 13px", marginBottom: 14 },
+  filterToggle: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    background: "transparent",
+    border: "none",
+    padding: 0,
+    margin: 0,
+    cursor: "pointer",
+    width: "100%",
+    textAlign: "left",
+    fontSize: 13,
+    fontWeight: 500,
+    color: "#6B6659",
+    letterSpacing: 0.2,
+  },
+  filterToggleActive: { fontSize: 11.5, fontWeight: 500, color: "#2B6E5E" },
 
   plainList: { listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: 10 },
   rowItem: { display: "flex", alignItems: "flex-start", gap: 10 },
@@ -8142,6 +8702,12 @@ const S = {
     borderRadius: 8,
     padding: "12px 14px",
     marginBottom: 16,
+  },
+  sortFilterBarBare: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 14,
+    alignItems: "flex-end",
   },
   sortFilterField: { display: "flex", flexDirection: "column", gap: 4, minWidth: 160 },
   sortFilterLabel: { fontSize: 10.5, color: "#5C594E", textTransform: "uppercase", letterSpacing: 0.5 },
